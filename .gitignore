@@ -216,3 +216,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+#################### ignored folders/files for this project ####################
+# Ignore the data folder and its contents
+bad_users/
+excel_files/
+users_22_juni_2026/
+raw_excel_files.py
+plots/
