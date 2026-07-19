@@ -55,17 +55,18 @@ EXPECTED_FINAL_COLORS_PER_LEVEL = 6
 MAIN_COLOR_LEVELS = 8
 
 # ============================================================
-# REPEATED ATTEMPT FILTER SETTINGS
+# ATTEMPT CLEANING SETTINGS
 # ============================================================
 
-REMOVE_SIGNIFICANTLY_WORSE_REPEATS = True
+REMOVE_ZERO_REPEATED_ATTEMPTS = True
+REMOVE_FAST_ZERO_ATTEMPTS = True
 
-# A repeated attempt must be at least this much worse than the best
-# attempt of the same participant/color level.
-REPEATED_WORSE_ABSOLUTE_DELTAE2000 = 15
+# 30 seconds = 30,000 milliseconds.
+FAST_ZERO_ATTEMPT_MAX_TIME_MS = 30_000
 
-# And it must also be this many times worse than the best attempt.
-REPEATED_WORSE_RELATIVE_FACTOR = 1.5
+# An attempt with 0 chosen colors across all 6 sublevels is treated
+# as a zero-chosen attempt.
+ZERO_CHOSEN_COLOR_TOTAL = 0
 
 # ============================================================
 # REGEX PATTERNS
@@ -874,6 +875,30 @@ def parse_participant_final_results(
             else None
         )
 
+        total_final_selected_colors = sum(
+            count
+            for count in sublevel_final_selected_counts
+            if count is not None
+        )
+
+        total_selected_actions = sum(
+            count
+            for count in sublevel_selected_action_counts
+            if count is not None
+        )
+
+        total_deselected_actions = sum(
+            count
+            for count in sublevel_deselected_action_counts
+            if count is not None
+        )
+
+        total_color_actions = sum(
+            count
+            for count in sublevel_total_action_counts
+            if count is not None
+        )
+
         has_missing_sublevel_timing = any(sublevel_missing_timing)
         has_failed_sublevel_quality = any(sublevel_failed_quality)
 
@@ -1029,6 +1054,11 @@ def parse_participant_final_results(
                 "whole_level_duration_ms": whole_level_duration_ms,
                 "sublevel_duration_ms": sublevel_duration_ms,
 
+                "total_final_selected_colors": total_final_selected_colors,
+                "total_selected_actions": total_selected_actions,
+                "total_deselected_actions": total_deselected_actions,
+                "total_color_actions": total_color_actions,
+
                 "sublevel_final_selected_color_count": final_selected_color_count,
                 "sublevel_selected_action_count": selected_action_count,
                 "sublevel_deselected_action_count": deselected_action_count,
@@ -1154,37 +1184,28 @@ def make_wide_level_row(level_df: pd.DataFrame) -> dict[str, Any]:
 
     return row
 
-
-def remove_significantly_worse_repeated_attempts(
+def remove_zero_and_fast_attempts(
     all_levels_long_df: pd.DataFrame,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Remove repeated attempts that are much worse than another attempt
-    of the same participant/file/color level.
+    Remove attempts that look like accidental or rushed non-attempts.
 
-    Comparison group:
-        participant_uuid + source_file + level_number + base_color
+    Rule 1:
+        Remove repeated attempts with 0 chosen colors if another attempt
+        of the same participant/file/color has more than 0 chosen colors.
 
-    Rule:
-        keep the best attempt
-        remove repeated attempts if they are:
-            - at least REPEATED_WORSE_ABSOLUTE_DELTAE2000 worse
-            - and at least REPEATED_WORSE_RELATIVE_FACTOR times worse
-
-    Returns:
-        filtered_long_df
-        repeated_discarded_attempts_df
+    Rule 2:
+        Remove any attempt with 0 chosen colors if the whole level took
+        less than FAST_ZERO_ATTEMPT_MAX_TIME_MS.
     """
-    if not REMOVE_SIGNIFICANTLY_WORSE_REPEATS:
-        return all_levels_long_df, pd.DataFrame()
-
     needed = [
         "participant_uuid",
         "source_file",
         "level_number",
         "base_color",
         "attempt_number",
-        "deltaE2000",
+        "total_final_selected_colors",
+        "whole_level_duration_ms",
     ]
 
     missing = [
@@ -1195,7 +1216,7 @@ def remove_significantly_worse_repeated_attempts(
 
     if missing:
         print(
-            "Skipping repeated-attempt filtering because these columns are missing:"
+            "Skipping zero/fast attempt filtering because these columns are missing:"
             f" {missing}"
         )
         return all_levels_long_df, pd.DataFrame()
@@ -1213,9 +1234,10 @@ def remove_significantly_worse_repeated_attempts(
         all_levels_long_df
         .groupby(attempt_cols, dropna=False)
         .agg(
+            total_final_selected_colors=("total_final_selected_colors", "first"),
+            total_color_actions=("total_color_actions", "first"),
+            whole_level_duration_ms=("whole_level_duration_ms", "first"),
             mean_deltaE2000=("deltaE2000", "mean"),
-            median_deltaE2000=("deltaE2000", "median"),
-            max_deltaE2000=("deltaE2000", "max"),
             n_final_colors=("final_index", "count"),
         )
         .reset_index()
@@ -1227,55 +1249,54 @@ def remove_significantly_worse_repeated_attempts(
         .transform("count")
     )
 
-    attempt_summary["best_mean_deltaE2000_same_color"] = (
+    attempt_summary["max_chosen_colors_same_color"] = (
         attempt_summary
-        .groupby(group_cols, dropna=False)["mean_deltaE2000"]
-        .transform("min")
+        .groupby(group_cols, dropna=False)["total_final_selected_colors"]
+        .transform("max")
     )
 
-    attempt_summary["difference_from_best_deltaE2000"] = (
-        attempt_summary["mean_deltaE2000"]
-        - attempt_summary["best_mean_deltaE2000_same_color"]
+    attempt_summary["is_zero_chosen_attempt"] = (
+        attempt_summary["total_final_selected_colors"]
+        <= ZERO_CHOSEN_COLOR_TOTAL
     )
 
-    attempt_summary["relative_to_best_deltaE2000"] = np.where(
-        attempt_summary["best_mean_deltaE2000_same_color"] > 0,
-        attempt_summary["mean_deltaE2000"]
-        / attempt_summary["best_mean_deltaE2000_same_color"],
-        np.inf,
-    )
-
-    attempt_summary["is_repeated_attempt"] = (
+    attempt_summary["has_other_attempt_with_choices"] = (
         attempt_summary["n_attempts_same_color"] >= 2
+    ) & (
+        attempt_summary["max_chosen_colors_same_color"] > ZERO_CHOSEN_COLOR_TOTAL
     )
 
-    attempt_summary["is_best_attempt_for_same_color"] = (
-        attempt_summary["difference_from_best_deltaE2000"] == 0
+    attempt_summary["remove_repeated_zero_chosen_attempt"] = (
+        REMOVE_ZERO_REPEATED_ATTEMPTS
+        & attempt_summary["is_zero_chosen_attempt"]
+        & attempt_summary["has_other_attempt_with_choices"]
     )
 
-    attempt_summary["discard_repeated_attempt_worse_than_best"] = (
-        attempt_summary["is_repeated_attempt"]
-        & ~attempt_summary["is_best_attempt_for_same_color"]
+    attempt_summary["remove_fast_zero_chosen_attempt"] = (
+        REMOVE_FAST_ZERO_ATTEMPTS
+        & attempt_summary["is_zero_chosen_attempt"]
+        & attempt_summary["whole_level_duration_ms"].notna()
         & (
-            attempt_summary["difference_from_best_deltaE2000"]
-            >= REPEATED_WORSE_ABSOLUTE_DELTAE2000
+            attempt_summary["whole_level_duration_ms"]
+            < FAST_ZERO_ATTEMPT_MAX_TIME_MS
         )
-        & (
-            attempt_summary["relative_to_best_deltaE2000"]
-            >= REPEATED_WORSE_RELATIVE_FACTOR
-        )
+    )
+
+    attempt_summary["remove_attempt"] = (
+        attempt_summary["remove_repeated_zero_chosen_attempt"]
+        | attempt_summary["remove_fast_zero_chosen_attempt"]
     )
 
     attempts_to_remove = attempt_summary[
-        attempt_summary["discard_repeated_attempt_worse_than_best"]
+        attempt_summary["remove_attempt"]
     ].copy()
 
     if attempts_to_remove.empty:
-        print("\nRepeated-attempt filter removed 0 attempts.")
+        print("\nZero/fast attempt filter removed 0 attempts.")
         return all_levels_long_df, pd.DataFrame()
 
     remove_keys = attempts_to_remove[attempt_cols].copy()
-    remove_keys["_remove_repeated_attempt"] = True
+    remove_keys["_remove_attempt"] = True
 
     marked_long_df = all_levels_long_df.merge(
         remove_keys,
@@ -1283,17 +1304,17 @@ def remove_significantly_worse_repeated_attempts(
         how="left",
     )
 
-    repeated_removed_long_df = marked_long_df[
-        marked_long_df["_remove_repeated_attempt"] == True
-    ].drop(columns=["_remove_repeated_attempt"])
+    removed_long_df = marked_long_df[
+        marked_long_df["_remove_attempt"] == True
+    ].drop(columns=["_remove_attempt"])
 
     filtered_long_df = marked_long_df[
-        marked_long_df["_remove_repeated_attempt"] != True
-    ].drop(columns=["_remove_repeated_attempt"])
+        marked_long_df["_remove_attempt"] != True
+    ].drop(columns=["_remove_attempt"])
 
-    repeated_discarded_rows: list[dict[str, Any]] = []
+    discarded_rows: list[dict[str, Any]] = []
 
-    for attempt_key, attempt_df in repeated_removed_long_df.groupby(
+    for attempt_key, attempt_df in removed_long_df.groupby(
         attempt_cols,
         dropna=False,
     ):
@@ -1306,37 +1327,45 @@ def remove_significantly_worse_repeated_attempts(
 
         summary_row = attempts_to_remove[key_filter].iloc[0]
 
-        wide_row["discard_reason"] = "repeated_attempt_significantly_worse_than_best"
+        if summary_row["remove_repeated_zero_chosen_attempt"]:
+            discard_reason = (
+                "repeated_zero_chosen_attempt_when_other_attempt_has_choices"
+            )
+        elif summary_row["remove_fast_zero_chosen_attempt"]:
+            discard_reason = "fast_zero_chosen_attempt_under_30_seconds"
+        else:
+            discard_reason = "zero_or_fast_attempt_removed"
+
+        wide_row["discard_reason"] = discard_reason
         wide_row["n_attempts_same_color"] = summary_row["n_attempts_same_color"]
-        wide_row["best_mean_deltaE2000_same_color"] = summary_row[
-            "best_mean_deltaE2000_same_color"
+        wide_row["total_final_selected_colors"] = summary_row[
+            "total_final_selected_colors"
         ]
-        wide_row["discarded_attempt_mean_deltaE2000"] = summary_row[
-            "mean_deltaE2000"
+        wide_row["total_color_actions"] = summary_row["total_color_actions"]
+        wide_row["whole_level_duration_ms"] = summary_row[
+            "whole_level_duration_ms"
         ]
-        wide_row["difference_from_best_deltaE2000"] = summary_row[
-            "difference_from_best_deltaE2000"
+        wide_row["max_chosen_colors_same_color"] = summary_row[
+            "max_chosen_colors_same_color"
         ]
-        wide_row["relative_to_best_deltaE2000"] = summary_row[
-            "relative_to_best_deltaE2000"
+        wide_row["remove_repeated_zero_chosen_attempt"] = summary_row[
+            "remove_repeated_zero_chosen_attempt"
         ]
-        wide_row["repeated_filter_absolute_threshold"] = (
-            REPEATED_WORSE_ABSOLUTE_DELTAE2000
-        )
-        wide_row["repeated_filter_relative_threshold"] = (
-            REPEATED_WORSE_RELATIVE_FACTOR
-        )
+        wide_row["remove_fast_zero_chosen_attempt"] = summary_row[
+            "remove_fast_zero_chosen_attempt"
+        ]
+        wide_row["fast_zero_attempt_max_time_ms"] = FAST_ZERO_ATTEMPT_MAX_TIME_MS
 
-        repeated_discarded_rows.append(wide_row)
+        discarded_rows.append(wide_row)
 
-    repeated_discarded_attempts_df = pd.DataFrame(repeated_discarded_rows)
+    discarded_attempts_df = pd.DataFrame(discarded_rows)
 
     print(
-        "\nRepeated-attempt filter removed "
-        f"{len(repeated_discarded_attempts_df)} significantly worse repeated attempts."
+        "\nZero/fast attempt filter removed "
+        f"{len(discarded_attempts_df)} attempts."
     )
 
-    return filtered_long_df, repeated_discarded_attempts_df
+    return filtered_long_df, discarded_attempts_df
 
 
 def create_combined_workbook() -> None:
@@ -1466,7 +1495,7 @@ def create_combined_workbook() -> None:
     all_levels_long_df = pd.DataFrame(all_long_rows)
 
     all_levels_long_df, repeated_discarded_attempts_df = (
-        remove_significantly_worse_repeated_attempts(all_levels_long_df)
+        remove_zero_and_fast_attempts(all_levels_long_df)
     )
 
     if not repeated_discarded_attempts_df.empty:

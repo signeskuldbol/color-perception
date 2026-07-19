@@ -26,7 +26,7 @@ def load_short_data() -> pd.DataFrame:
     Load the all_levels_short sheet from the combined Excel file.
 
     This sheet should contain:
-        one row per participant × completed level attempt
+        one row per participant x completed level attempt
     """
     if not excel_file.exists():
         raise FileNotFoundError(
@@ -65,7 +65,7 @@ def load_long_data() -> pd.DataFrame:
     Load the all_final_colors_long sheet from the combined Excel file.
 
     This sheet contains:
-        one row per participant × level attempt × final color/sublevel
+        one row per participant x level attempt x final color/sublevel
     """
     if not excel_file.exists():
         raise FileNotFoundError(
