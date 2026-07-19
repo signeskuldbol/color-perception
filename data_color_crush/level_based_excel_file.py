@@ -1,32 +1,22 @@
 """
-Create one combined Excel file from Color Crush participant .txt exports.
+TODO write a proper README.md for this project.
 
-The output workbook contains:
-    - participant_summary:
-        one row per participant
-    - all_levels_long:
-        one row per participant per level per final color index
-    - level_1 ... level_9:
-        one row per participant, containing the final result for that level
-
-This script focuses only on finalcolors results, not the full selection/deselection process.
 
 Expected project structure:
 
 color-perception/
-├── create_combined_final_results.py
 └── data_color_crush/
+    ├── this script
     ├── users_22_juni_2026/
     │   ├── participant_file_1.txt
     │   ├── participant_file_2.txt
     │   └── ...
     └── excel_files/
-        └── combined_final_results.xlsx
-
+        ├── combined_final_results.xlsx
+        └── discarded_results.xlsx
 """
 
 from __future__ import annotations
-
 from skimage.color import rgb2lab, deltaE_ciede2000, deltaE_cie76
 import json
 import numpy as np
@@ -48,6 +38,34 @@ output_folder = project_folder / "excel_files"
 
 output_file = output_folder / "combined_final_results.xlsx"
 
+discarded_output_file = output_folder / "discarded_results.xlsx"
+
+# 5 seconds = 5,000 milliseconds.
+MIN_SUBLEVEL_TIME_MS = 5_000
+
+# Fallback threshold for a whole level attempt.
+# 6 sublevels × 5 seconds = 30 seconds.
+MIN_WHOLE_LEVEL_TIME_MS = 30_000
+
+# For now: discard if a too-fast sublevel has zero chosen colors.
+MIN_COLORS_CHOSEN_PER_SUBLEVEL = 1
+
+EXPECTED_FINAL_COLORS_PER_LEVEL = 6
+
+MAIN_COLOR_LEVELS = 8
+
+# ============================================================
+# REPEATED ATTEMPT FILTER SETTINGS
+# ============================================================
+
+REMOVE_SIGNIFICANTLY_WORSE_REPEATS = True
+
+# A repeated attempt must be at least this much worse than the best
+# attempt of the same participant/color level.
+REPEATED_WORSE_ABSOLUTE_DELTAE2000 = 15
+
+# And it must also be this many times worse than the best attempt.
+REPEATED_WORSE_RELATIVE_FACTOR = 1.5
 
 # ============================================================
 # REGEX PATTERNS
@@ -60,10 +78,7 @@ DEMOGRAPHICS_RE = re.compile(
     re.DOTALL,
 )
 
-COLOR_BLOCK_RE = re.compile(
-    r"Color ID:\s*([A-Fa-f0-9]{6})\s*\n\s*Data:\s*(\{.*?\})\s*(?=\n\s*Color ID:|\Z)",
-    re.DOTALL,
-)
+
 
 # ============================================================
 # LEVEL MAPPING
@@ -268,6 +283,96 @@ def parse_demographics(full_text: str, source_file: Path) -> dict[str, Any]:
 
     return out
 
+def build_combined_log_stream(full_text: str) -> list[dict[str, Any]]:
+    """
+    Build one combined log stream directly from the raw text.
+
+    This does NOT depend on valid JSON blocks.
+    It reads the file line by line and extracts quoted log lines.
+
+    Important:
+        Color ID blocks are only used as storage metadata.
+        They are NOT used as level boundaries.
+
+    The true gameplay order comes from the numeric timestamp at the
+    beginning of each log line.
+    """
+    log_rows: list[dict[str, Any]] = []
+
+    current_color_block_id = None
+    current_block_index = -1
+    current_block_session_timestamp = None
+
+    file_order = 0
+
+    color_id_re = re.compile(r"^\s*Color ID:\s*([A-Fa-f0-9]{6})\s*$")
+    timestamp_re = re.compile(r'"timestamp"\s*:\s*"([^"]+)"')
+
+    # Matches lines like:
+    # "132642495,emojirewarded,reshot-icon",
+    # "133024729,finalcolors,EA39DF ..."
+    log_line_re = re.compile(r'^\s*"([^"]*)"\s*,?\s*$')
+
+    for raw_line_number, line in enumerate(full_text.splitlines(), start=1):
+        color_match = color_id_re.match(line)
+
+        if color_match:
+            current_color_block_id = color_match.group(1).upper()
+            current_block_index += 1
+            current_block_session_timestamp = None
+            continue
+
+        timestamp_match = timestamp_re.search(line)
+
+        if timestamp_match:
+            current_block_session_timestamp = timestamp_match.group(1)
+            continue
+
+        log_match = log_line_re.match(line)
+
+        if not log_match:
+            continue
+
+        log = log_match.group(1)
+
+        timestamp_ms, event_type, payload = split_log_line(log)
+
+        # Only keep real game-style log lines.
+        if timestamp_ms is None or event_type is None:
+            continue
+
+        # Ignore tutorial / black color block completely.
+        if current_color_block_id in TUTORIAL_COLORS:
+            continue
+
+        log_rows.append(
+            {
+                "file_order": file_order,
+                "raw_line_number": raw_line_number,
+                "timestamp_ms": timestamp_ms,
+                "event_type": event_type,
+                "payload": payload,
+                "block_index": current_block_index,
+                "color_block_id": current_color_block_id,
+                "block_session_timestamp": current_block_session_timestamp,
+                "block_log_index": None,
+                "log": log,
+            }
+        )
+
+        file_order += 1
+
+    # This is the key fix:
+    # gameplay order comes from the numeric timestamp, not from block order.
+    log_rows = sorted(
+        log_rows,
+        key=lambda row: (
+            row["timestamp_ms"],
+            row["file_order"],
+        ),
+    )
+
+    return log_rows
 
 def parse_finalcolors_payload(
     payload: str,
@@ -294,7 +399,7 @@ def parse_finalcolors_payload(
 
     rows: list[dict[str, Any]] = []
 
-    n = max(len(hex_colors), 8)
+    n = EXPECTED_FINAL_COLORS_PER_LEVEL
 
     for i in range(n):
         final_hex = hex_colors[i].upper() if i < len(hex_colors) else None
@@ -331,86 +436,357 @@ def parse_finalcolors_payload(
 
     return rows
 
-
-def parse_participant_final_results(path: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+def parse_participant_final_results(
+    path: Path,
+) -> tuple[
+    dict[str, Any],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    bool,
+]:
     """
-    Extract demographics and all finalcolors results from one participant file.
+    Extract demographics and finalcolors results from one participant file.
 
-    The important part:
-        level_number is assigned by sorting finalcolors entries by timestamp_ms.
-        This is safer than trusting the order of Color ID blocks in the text file.
+    Returns:
+        demographics
+        kept_long_rows
+        discarded_level_attempts
+        is_empty_file
+
+    Filtering rule:
+        A whole level attempt is discarded if any sublevel has:
+            duration < MIN_SUBLEVEL_TIME_MS
+            AND
+            chosen color count < MIN_COLORS_CHOSEN_PER_SUBLEVEL
+
+    Missing timing is marked as missing. It is not guessed from the last
+    available timestamp.
     """
     text = path.read_text(encoding="utf-8", errors="replace")
     demographics = parse_demographics(text, path)
 
-    final_events: list[dict[str, Any]] = []
+    level_attempt_events: list[dict[str, Any]] = []
+    kept_long_rows: list[dict[str, Any]] = []
+    discarded_level_attempts: list[dict[str, Any]] = []
 
-    for color_id, json_text in COLOR_BLOCK_RE.findall(text):
-        block = load_json_object(json_text)
+    log_rows = build_combined_log_stream(text)
 
-        if not block:
-            continue
+    if not log_rows:
+        discarded_level_attempts.append(
+            {
+                **demographics,
+                "discard_reason": "no_log_rows_found_in_raw_text",
+            }
+        )
 
-        session_timestamp = block.get("timestamp")
-        logs = block.get("logs", []) or []
+    active_level = False
 
-        current_base_color = color_id.upper()
+    current_base_color = None
+    current_level_start_ms = None
+    current_level_start_file_order = None
+    current_level_started_in_color_block_id = None
+    current_level_started_in_block_index = None
+    current_level_started_session_timestamp = None
 
-        for log_index, log in enumerate(logs):
-            timestamp_ms, event_type, payload = split_log_line(log)
+    current_sublevel_starts: list[int] = []
+    current_sublevel_end_times: list[int | None] = []
 
-            if event_type == "gamelevelbegun":
-                if re.fullmatch(r"[A-Fa-f0-9]{6}", payload):
-                    current_base_color = payload.upper()
+    current_sublevel_selected_sets: list[set[str]] = []
 
-            if event_type == "finalcolors":
-                base_r, base_g, base_b = hex_to_rgb255(current_base_color)
+    current_sublevel_selected_action_counts: list[int] = []
+    current_sublevel_deselected_action_counts: list[int] = []
+    current_sublevel_total_action_counts: list[int] = []
 
-                final_events.append(
+    console_output_count = 0
+    console_error_count = 0
+
+    for row in log_rows:
+        timestamp_ms = row["timestamp_ms"]
+        event_type = row["event_type"]
+        payload = row["payload"]
+
+        event_type_lower = (
+            event_type.lower()
+            if event_type is not None
+            else ""
+        )
+
+        # ----------------------------------------------------
+        # Start of a real color level attempt
+        # ----------------------------------------------------
+        if event_type_lower == "gamelevelbegun":
+            # If a new level starts before the previous one had finalcolors,
+            # the previous one is incomplete and should not leak forward.
+            if active_level:
+                discarded_level_attempts.append(
                     {
-                        "participant_uuid": demographics.get("participant_uuid"),
-                        "userID": demographics.get("userID"),
-                        "source_file": path.name,
-                        "color_block_id": color_id.upper(),
+                        **demographics,
+                        "discard_reason": "new_gamelevelbegun_before_previous_finalcolors",
+                        "level_number": LEVEL_BY_BASE_COLOR.get(current_base_color),
                         "base_color": current_base_color,
-                        "base_R": base_r,
-                        "base_G": base_g,
-                        "base_B": base_b,
-                        "session_timestamp": session_timestamp,
-                        "timestamp_ms": timestamp_ms,
-                        "log_index": log_index,
-                        "payload": payload,
+                        "level_start_ms": current_level_start_ms,
+                        "level_start_file_order": current_level_start_file_order,
+                        "ended_before_finalcolors_file_order": row["file_order"],
                     }
                 )
 
+            if re.fullmatch(r"[A-Fa-f0-9]{6}", payload):
+                current_base_color = payload.upper()
+            else:
+                current_base_color = None
 
-    final_events = sorted(
-        final_events,
-        key=lambda x: (
-            x["session_timestamp"] or "",
-            x["timestamp_ms"] if x["timestamp_ms"] is not None else float("inf"),
-            x["log_index"],
-        ),
-    )
+            # Ignore tutorial or unknown colors.
+            if (
+                current_base_color is None
+                or current_base_color in TUTORIAL_COLORS
+                or current_base_color not in LEVEL_BY_BASE_COLOR
+            ):
+                active_level = False
+                current_base_color = None
+                continue
 
-    long_rows: list[dict[str, Any]] = []
+            active_level = True
+
+            current_level_start_ms = timestamp_ms
+            current_level_start_file_order = row["file_order"]
+            current_level_started_in_color_block_id = row["color_block_id"]
+            current_level_started_in_block_index = row["block_index"]
+            current_level_started_session_timestamp = row["block_session_timestamp"]
+
+            current_sublevel_starts = []
+            current_sublevel_end_times = []
+
+            current_sublevel_selected_sets = []
+
+            current_sublevel_selected_action_counts = []
+            current_sublevel_deselected_action_counts = []
+            current_sublevel_total_action_counts = []
+
+            console_output_count = 0
+            console_error_count = 0
+
+            continue
+
+        # Ignore everything until a real gamelevelbegun has started.
+        if not active_level:
+            continue
+
+        # ----------------------------------------------------
+        # Console output / error messages
+        # ----------------------------------------------------
+        if event_type_lower == "consoleoutput":
+            console_output_count += 1
+
+            if "error" in str(payload).lower():
+                console_error_count += 1
+
+            continue
+
+        # ----------------------------------------------------
+        # A new sublevel starts at colorsgenerated,0
+        # ----------------------------------------------------
+        if event_type_lower == "colorsgenerated":
+            payload_parts = str(payload).split()
+            generated_index = None
+
+            if payload_parts:
+                try:
+                    generated_index = int(payload_parts[0])
+                except ValueError:
+                    generated_index = None
+
+            # Only colorsgenerated,0 starts a new sublevel.
+            # colorsgenerated,1 through colorsgenerated,11 belong to
+            # the same sublevel.
+            if generated_index == 0 and timestamp_ms is not None:
+                current_sublevel_starts.append(timestamp_ms)
+                current_sublevel_end_times.append(None)
+
+                current_sublevel_selected_sets.append(set())
+                current_sublevel_selected_action_counts.append(0)
+                current_sublevel_deselected_action_counts.append(0)
+                current_sublevel_total_action_counts.append(0)
+
+            continue
+
+        # ----------------------------------------------------
+        # Color selected inside current sublevel
+        # ----------------------------------------------------
+        if event_type_lower == "colorselected":
+            if current_sublevel_selected_sets:
+                current_sublevel_index = len(current_sublevel_selected_sets) - 1
+
+                selected_id = str(payload).strip()
+
+                if selected_id:
+                    current_sublevel_selected_sets[current_sublevel_index].add(
+                        selected_id
+                    )
+
+                current_sublevel_selected_action_counts[current_sublevel_index] += 1
+                current_sublevel_total_action_counts[current_sublevel_index] += 1
+
+            continue
+
+        # ----------------------------------------------------
+        # Color deselected inside current sublevel
+        # ----------------------------------------------------
+        if event_type_lower == "colordeselected":
+            if current_sublevel_selected_sets:
+                current_sublevel_index = len(current_sublevel_selected_sets) - 1
+
+                selected_id = str(payload).strip()
+
+                if selected_id:
+                    current_sublevel_selected_sets[current_sublevel_index].discard(
+                        selected_id
+                    )
+
+                current_sublevel_deselected_action_counts[current_sublevel_index] += 1
+                current_sublevel_total_action_counts[current_sublevel_index] += 1
+
+            continue
+
+        # ----------------------------------------------------
+        # End of one sublevel
+        # ----------------------------------------------------
+        if event_type_lower == "colorssubmitted":
+            if current_sublevel_end_times and timestamp_ms is not None:
+                current_sublevel_index = len(current_sublevel_end_times) - 1
+                current_sublevel_end_times[current_sublevel_index] = timestamp_ms
+
+            continue
+
+        # ----------------------------------------------------
+        # End of the whole color level attempt
+        # ----------------------------------------------------
+        if event_type_lower == "finalcolors":
+            if current_sublevel_end_times and timestamp_ms is not None:
+                last_index = len(current_sublevel_end_times) - 1
+
+                if current_sublevel_end_times[last_index] is None:
+                    current_sublevel_end_times[last_index] = timestamp_ms
+
+            base_r, base_g, base_b = hex_to_rgb255(current_base_color)
+
+            level_attempt_events.append(
+                {
+                    "participant_uuid": demographics.get("participant_uuid"),
+                    "userID": demographics.get("userID"),
+                    "source_file": path.name,
+
+                    # Diagnostic info about where the attempt started/ended.
+                    "level_started_in_color_block_id": current_level_started_in_color_block_id,
+                    "level_ended_in_color_block_id": row["color_block_id"],
+                    "level_started_in_block_index": current_level_started_in_block_index,
+                    "level_ended_in_block_index": row["block_index"],
+                    "crossed_color_block_boundary": (
+                        current_level_started_in_block_index != row["block_index"]
+                    ),
+
+                    "color_block_id": current_level_started_in_color_block_id,
+                    "base_color": current_base_color,
+                    "base_R": base_r,
+                    "base_G": base_g,
+                    "base_B": base_b,
+
+                    "session_timestamp": current_level_started_session_timestamp,
+                    "finalcolors_block_session_timestamp": row["block_session_timestamp"],
+
+                    "level_start_ms": current_level_start_ms,
+                    "level_start_file_order": current_level_start_file_order,
+                    "finalcolors_timestamp_ms": timestamp_ms,
+                    "finalcolors_file_order": row["file_order"],
+
+                    "sublevel_start_times": current_sublevel_starts.copy(),
+                    "sublevel_end_times": current_sublevel_end_times.copy(),
+
+                    "sublevel_final_selected_counts": [
+                        len(selected_set)
+                        for selected_set in current_sublevel_selected_sets
+                    ],
+
+                    "sublevel_selected_action_counts": current_sublevel_selected_action_counts.copy(),
+                    "sublevel_deselected_action_counts": current_sublevel_deselected_action_counts.copy(),
+                    "sublevel_total_action_counts": current_sublevel_total_action_counts.copy(),
+
+                    "console_output_count": console_output_count,
+                    "console_error_count": console_error_count,
+
+                    "log_index": row["file_order"],
+                    "payload": payload,
+                }
+            )
+
+            # Very important:
+            # the level is now finished, so nothing after this should leak
+            # into the next level.
+            active_level = False
+            current_base_color = None
+            current_level_start_ms = None
+            current_level_start_file_order = None
+
+            current_sublevel_starts = []
+            current_sublevel_end_times = []
+            current_sublevel_selected_sets = []
+            current_sublevel_selected_action_counts = []
+            current_sublevel_deselected_action_counts = []
+            current_sublevel_total_action_counts = []
+
+            console_output_count = 0
+            console_error_count = 0
+
+            continue
+
+        # ----------------------------------------------------
+        # gamelevelend without finalcolors = incomplete attempt
+        # ----------------------------------------------------
+        if event_type_lower == "gamelevelend":
+            discarded_level_attempts.append(
+                {
+                    **demographics,
+                    "discard_reason": "gamelevelend_without_finalcolors",
+                    "level_number": LEVEL_BY_BASE_COLOR.get(current_base_color),
+                    "base_color": current_base_color,
+                    "level_start_ms": current_level_start_ms,
+                    "level_start_file_order": current_level_start_file_order,
+                    "gamelevelend_timestamp_ms": timestamp_ms,
+                    "gamelevelend_file_order": row["file_order"],
+                    "console_output_count": console_output_count,
+                    "console_error_count": console_error_count,
+                }
+            )
+
+            active_level = False
+            current_base_color = None
+            current_level_start_ms = None
+            current_level_start_file_order = None
+
+            current_sublevel_starts = []
+            current_sublevel_end_times = []
+            current_sublevel_selected_sets = []
+            current_sublevel_selected_action_counts = []
+            current_sublevel_deselected_action_counts = []
+            current_sublevel_total_action_counts = []
+
+            console_output_count = 0
+            console_error_count = 0
+
+            continue
 
     attempt_counter_by_base_color: dict[str, int] = {}
 
-    for event in final_events:
+    for event in level_attempt_events:
         base_color = event["base_color"]
 
-        # Skip tutorial colors, for example 000000.
         if base_color in TUTORIAL_COLORS:
             continue
 
-        # Skip unknown colors that are not part of the 8 real levels.
         if base_color not in LEVEL_BY_BASE_COLOR:
             continue
 
         level_number = LEVEL_BY_BASE_COLOR[base_color]
 
-        # Count repeated completions of the same color for this participant.
         attempt_counter_by_base_color[base_color] = (
             attempt_counter_by_base_color.get(base_color, 0) + 1
         )
@@ -422,33 +798,261 @@ def parse_participant_final_results(path: Path) -> tuple[dict[str, Any], list[di
             event["base_color"],
         )
 
+        sublevel_start_times = event["sublevel_start_times"]
+        sublevel_end_times = event["sublevel_end_times"]
+
+        sublevel_final_selected_counts = event["sublevel_final_selected_counts"]
+        sublevel_selected_action_counts = event["sublevel_selected_action_counts"]
+        sublevel_deselected_action_counts = event["sublevel_deselected_action_counts"]
+        sublevel_total_action_counts = event["sublevel_total_action_counts"]
+
+        finalcolors_timestamp_ms = event["finalcolors_timestamp_ms"]
+
+        level_start_ms = event["level_start_ms"]
+
+        whole_level_duration_ms = None
+
+        if level_start_ms is not None and finalcolors_timestamp_ms is not None:
+            whole_level_duration_ms = finalcolors_timestamp_ms - level_start_ms
+
+        sublevel_durations: list[int | None] = []
+        sublevel_missing_timing: list[bool] = []
+        sublevel_too_fast: list[bool] = []
+        sublevel_too_few_choices: list[bool] = []
+        sublevel_failed_quality: list[bool] = []
+
+        for i in range(EXPECTED_FINAL_COLORS_PER_LEVEL):
+            duration = None
+
+            if (
+                i < len(sublevel_start_times)
+                and i < len(sublevel_end_times)
+                and sublevel_start_times[i] is not None
+                and sublevel_end_times[i] is not None
+            ):
+                duration = sublevel_end_times[i] - sublevel_start_times[i]
+
+            sublevel_durations.append(duration)
+
+            missing_timing = duration is None
+            sublevel_missing_timing.append(missing_timing)
+
+            chosen_count = (
+                sublevel_final_selected_counts[i]
+                if i < len(sublevel_final_selected_counts)
+                else None
+            )
+
+            too_fast = (
+                duration is not None
+                and duration < MIN_SUBLEVEL_TIME_MS
+            )
+
+            too_few_choices = (
+                chosen_count is None
+                or chosen_count < MIN_COLORS_CHOSEN_PER_SUBLEVEL
+            )
+
+            failed_quality = (
+                too_fast
+                and too_few_choices
+            )
+
+            sublevel_too_fast.append(too_fast)
+            sublevel_too_few_choices.append(too_few_choices)
+            sublevel_failed_quality.append(failed_quality)
+
+        valid_durations = [
+            duration
+            for duration in sublevel_durations
+            if duration is not None
+        ]
+
+        min_sublevel_duration_ms = (
+            min(valid_durations)
+            if valid_durations
+            else None
+        )
+
+        has_missing_sublevel_timing = any(sublevel_missing_timing)
+        has_failed_sublevel_quality = any(sublevel_failed_quality)
+
+        has_whole_level_timing = whole_level_duration_ms is not None
+
+        whole_level_too_fast = (
+            has_whole_level_timing
+            and whole_level_duration_ms < MIN_WHOLE_LEVEL_TIME_MS
+        )
+
+        # Fallback rule:
+        # Only use whole-level timing when sublevel timing is missing.
+        failed_whole_level_fallback_quality = (
+            has_missing_sublevel_timing
+            and whole_level_too_fast
+        )
+
+        discard_reason = ""
+
+        if has_failed_sublevel_quality:
+            discard_reason = "too_fast_and_too_few_colors_chosen"
+
+        elif failed_whole_level_fallback_quality:
+            discard_reason = "whole_level_too_fast_missing_sublevel_timing"
+
+        has_failed_level_quality = (
+            has_failed_sublevel_quality
+            or failed_whole_level_fallback_quality
+        )
+
+        # Discard the entire level attempt if one sublevel fails both rules.
+        if has_failed_level_quality:
+            discarded_row = {
+                **demographics,
+                "discard_reason": discard_reason,
+                "level_number": level_number,
+                "attempt_number": attempt_number,
+                "color_block_id": event["color_block_id"],
+                "base_color": event["base_color"],
+                "level_started_in_color_block_id": event.get("level_started_in_color_block_id"),
+                "level_ended_in_color_block_id": event.get("level_ended_in_color_block_id"),
+                "crossed_color_block_boundary": event.get("crossed_color_block_boundary"),
+                "level_start_file_order": event.get("level_start_file_order"),
+                "finalcolors_file_order": event.get("finalcolors_file_order"),
+                "console_output_count": event.get("console_output_count"),
+                "console_error_count": event.get("console_error_count"),
+                "level_start_ms": event["level_start_ms"],
+                "finalcolors_timestamp_ms": finalcolors_timestamp_ms,
+                "whole_level_duration_ms": whole_level_duration_ms,
+                "whole_level_too_fast": whole_level_too_fast,
+                "failed_whole_level_fallback_quality": failed_whole_level_fallback_quality,
+                "min_sublevel_duration_ms": min_sublevel_duration_ms,
+                "has_missing_sublevel_timing": has_missing_sublevel_timing,
+            }
+
+            for i in range(EXPECTED_FINAL_COLORS_PER_LEVEL):
+                discarded_row[f"sublevel_{i}_duration_ms"] = sublevel_durations[i]
+                discarded_row[f"sublevel_{i}_missing_timing"] = sublevel_missing_timing[i]
+
+                final_selected_count = (
+                    sublevel_final_selected_counts[i]
+                    if i < len(sublevel_final_selected_counts)
+                    else None
+                )
+
+                selected_action_count = (
+                    sublevel_selected_action_counts[i]
+                    if i < len(sublevel_selected_action_counts)
+                    else None
+                )
+
+                deselected_action_count = (
+                    sublevel_deselected_action_counts[i]
+                    if i < len(sublevel_deselected_action_counts)
+                    else None
+                )
+
+                total_action_count = (
+                    sublevel_total_action_counts[i]
+                    if i < len(sublevel_total_action_counts)
+                    else None
+                )
+
+                discarded_row[f"sublevel_{i}_final_selected_color_count"] = final_selected_count
+                discarded_row[f"sublevel_{i}_selected_action_count"] = selected_action_count
+                discarded_row[f"sublevel_{i}_deselected_action_count"] = deselected_action_count
+                discarded_row[f"sublevel_{i}_total_color_action_count"] = total_action_count
+
+                # Keep old name for compatibility with older plotting code.
+                discarded_row[f"sublevel_{i}_chosen_color_count"] = final_selected_count
+                discarded_row[f"sublevel_{i}_too_fast"] = sublevel_too_fast[i]
+                discarded_row[f"sublevel_{i}_too_few_choices"] = sublevel_too_few_choices[i]
+                discarded_row[f"sublevel_{i}_failed_quality"] = sublevel_failed_quality[i]
+
+            for parsed in parsed_final_colors:
+                i = parsed["final_index"]
+
+                discarded_row[f"final_{i}_hex"] = parsed.get("final_hex")
+                discarded_row[f"final_{i}_deltaE76"] = parsed.get("deltaE76")
+                discarded_row[f"final_{i}_deltaE2000"] = parsed.get("deltaE2000")
+
+            discarded_level_attempts.append(discarded_row)
+            continue
+
+        # If the level attempt passes, keep all final-color rows.
+        # Save timing and chosen-color information in the good Excel too.
         for parsed in parsed_final_colors:
-            long_rows.append(
+            final_index = parsed["final_index"]
+
+            sublevel_duration_ms = None
+            sublevel_has_missing_timing = True
+            final_selected_color_count = None
+            selected_action_count = None
+            deselected_action_count = None
+            total_color_action_count = None
+
+            chosen_color_count = None
+            too_fast = False
+            too_few_choices = False
+            failed_quality = False
+
+            if final_index < EXPECTED_FINAL_COLORS_PER_LEVEL:
+                sublevel_duration_ms = sublevel_durations[final_index]
+                sublevel_has_missing_timing = sublevel_missing_timing[final_index]
+
+                if final_index < len(sublevel_final_selected_counts):
+                    final_selected_color_count = sublevel_final_selected_counts[final_index]
+                    chosen_color_count = final_selected_color_count
+
+                if final_index < len(sublevel_selected_action_counts):
+                    selected_action_count = sublevel_selected_action_counts[final_index]
+
+                if final_index < len(sublevel_deselected_action_counts):
+                    deselected_action_count = sublevel_deselected_action_counts[final_index]
+
+                if final_index < len(sublevel_total_action_counts):
+                    total_color_action_count = sublevel_total_action_counts[final_index]
+
+                too_fast = sublevel_too_fast[final_index]
+                too_few_choices = sublevel_too_few_choices[final_index]
+                failed_quality = sublevel_failed_quality[final_index]
+
+            kept_long_rows.append(
                 {
-                    **demographics,
-                    "level_number": level_number,
-                    "attempt_number": attempt_number,
-                    "color_block_id": event["color_block_id"],
-                    "base_color": event["base_color"],
-                    "base_R": event["base_R"],
-                    "base_G": event["base_G"],
-                    "base_B": event["base_B"],
-                    "session_timestamp": event["session_timestamp"],
-                    "timestamp_ms": event["timestamp_ms"],
-                    "log_index": event["log_index"],
-                    **parsed,
+                **demographics,
+                "level_number": level_number,
+                "attempt_number": attempt_number,
+                "base_color": event["base_color"],
+                "base_R": event["base_R"],
+                "base_G": event["base_G"],
+                "base_B": event["base_B"],
+
+                "whole_level_duration_ms": whole_level_duration_ms,
+                "sublevel_duration_ms": sublevel_duration_ms,
+
+                "sublevel_final_selected_color_count": final_selected_color_count,
+                "sublevel_selected_action_count": selected_action_count,
+                "sublevel_deselected_action_count": deselected_action_count,
+                "sublevel_total_color_action_count": total_color_action_count,
+
+                "sublevel_chosen_color_count": chosen_color_count,
+
+                **parsed,
                 }
             )
 
-    return demographics, long_rows
+    is_empty_file = (
+        len(kept_long_rows) == 0
+        and len(discarded_level_attempts) == 0
+    )
 
+    return demographics, kept_long_rows, discarded_level_attempts, is_empty_file
 
 def make_wide_level_row(level_df: pd.DataFrame) -> dict[str, Any]:
     """
     Convert one participant's long level data into one wide row.
 
     Input:
-        8 rows, one for each final_index
+        6 rows, one for each final_index
 
     Output:
         one row with columns like:
@@ -456,8 +1060,8 @@ def make_wide_level_row(level_df: pd.DataFrame) -> dict[str, Any]:
             final_0_lab_L
             final_0_lab_a
             ...
-            final_7_hex
-            final_7_lab_L
+            final_5_hex
+            final_5_lab_L
             ...
     """
     if level_df.empty:
@@ -479,13 +1083,11 @@ def make_wide_level_row(level_df: pd.DataFrame) -> dict[str, Any]:
         "levels_completed_from_filename": first.get("levels_completed_from_filename"),
         "level_number": first.get("level_number"),
         "attempt_number": first.get("attempt_number"),
-        "color_block_id": first.get("color_block_id"),
         "base_color": first.get("base_color"),
         "base_R": first.get("base_R"),
         "base_G": first.get("base_G"),
         "base_B": first.get("base_B"),
-        "session_timestamp": first.get("session_timestamp"),
-        "timestamp_ms": first.get("timestamp_ms"),
+        "whole_level_duration_ms": first.get("whole_level_duration_ms"),
     }
 
     for _, r in level_df.sort_values("final_index").iterrows():
@@ -506,6 +1108,20 @@ def make_wide_level_row(level_df: pd.DataFrame) -> dict[str, Any]:
 
         row[f"final_{i}_deltaE76"] = r.get("deltaE76")
         row[f"final_{i}_deltaE2000"] = r.get("deltaE2000")
+
+        row[f"final_{i}_sublevel_final_selected_color_count"] = r.get(
+            "sublevel_final_selected_color_count"
+        )
+        row[f"final_{i}_sublevel_selected_action_count"] = r.get(
+            "sublevel_selected_action_count"
+        )
+        row[f"final_{i}_sublevel_deselected_action_count"] = r.get(
+            "sublevel_deselected_action_count"
+        )
+        row[f"final_{i}_sublevel_total_color_action_count"] = r.get(
+            "sublevel_total_color_action_count"
+        )
+        row[f"final_{i}_sublevel_duration_ms"] = r.get("sublevel_duration_ms")
 
     deltaE76_values = pd.to_numeric(level_df["deltaE76"], errors="coerce").dropna()
     deltaE2000_values = pd.to_numeric(level_df["deltaE2000"], errors="coerce").dropna()
@@ -539,6 +1155,190 @@ def make_wide_level_row(level_df: pd.DataFrame) -> dict[str, Any]:
     return row
 
 
+def remove_significantly_worse_repeated_attempts(
+    all_levels_long_df: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Remove repeated attempts that are much worse than another attempt
+    of the same participant/file/color level.
+
+    Comparison group:
+        participant_uuid + source_file + level_number + base_color
+
+    Rule:
+        keep the best attempt
+        remove repeated attempts if they are:
+            - at least REPEATED_WORSE_ABSOLUTE_DELTAE2000 worse
+            - and at least REPEATED_WORSE_RELATIVE_FACTOR times worse
+
+    Returns:
+        filtered_long_df
+        repeated_discarded_attempts_df
+    """
+    if not REMOVE_SIGNIFICANTLY_WORSE_REPEATS:
+        return all_levels_long_df, pd.DataFrame()
+
+    needed = [
+        "participant_uuid",
+        "source_file",
+        "level_number",
+        "base_color",
+        "attempt_number",
+        "deltaE2000",
+    ]
+
+    missing = [
+        col
+        for col in needed
+        if col not in all_levels_long_df.columns
+    ]
+
+    if missing:
+        print(
+            "Skipping repeated-attempt filtering because these columns are missing:"
+            f" {missing}"
+        )
+        return all_levels_long_df, pd.DataFrame()
+
+    group_cols = [
+        "participant_uuid",
+        "source_file",
+        "level_number",
+        "base_color",
+    ]
+
+    attempt_cols = group_cols + ["attempt_number"]
+
+    attempt_summary = (
+        all_levels_long_df
+        .groupby(attempt_cols, dropna=False)
+        .agg(
+            mean_deltaE2000=("deltaE2000", "mean"),
+            median_deltaE2000=("deltaE2000", "median"),
+            max_deltaE2000=("deltaE2000", "max"),
+            n_final_colors=("final_index", "count"),
+        )
+        .reset_index()
+    )
+
+    attempt_summary["n_attempts_same_color"] = (
+        attempt_summary
+        .groupby(group_cols, dropna=False)["attempt_number"]
+        .transform("count")
+    )
+
+    attempt_summary["best_mean_deltaE2000_same_color"] = (
+        attempt_summary
+        .groupby(group_cols, dropna=False)["mean_deltaE2000"]
+        .transform("min")
+    )
+
+    attempt_summary["difference_from_best_deltaE2000"] = (
+        attempt_summary["mean_deltaE2000"]
+        - attempt_summary["best_mean_deltaE2000_same_color"]
+    )
+
+    attempt_summary["relative_to_best_deltaE2000"] = np.where(
+        attempt_summary["best_mean_deltaE2000_same_color"] > 0,
+        attempt_summary["mean_deltaE2000"]
+        / attempt_summary["best_mean_deltaE2000_same_color"],
+        np.inf,
+    )
+
+    attempt_summary["is_repeated_attempt"] = (
+        attempt_summary["n_attempts_same_color"] >= 2
+    )
+
+    attempt_summary["is_best_attempt_for_same_color"] = (
+        attempt_summary["difference_from_best_deltaE2000"] == 0
+    )
+
+    attempt_summary["discard_repeated_attempt_worse_than_best"] = (
+        attempt_summary["is_repeated_attempt"]
+        & ~attempt_summary["is_best_attempt_for_same_color"]
+        & (
+            attempt_summary["difference_from_best_deltaE2000"]
+            >= REPEATED_WORSE_ABSOLUTE_DELTAE2000
+        )
+        & (
+            attempt_summary["relative_to_best_deltaE2000"]
+            >= REPEATED_WORSE_RELATIVE_FACTOR
+        )
+    )
+
+    attempts_to_remove = attempt_summary[
+        attempt_summary["discard_repeated_attempt_worse_than_best"]
+    ].copy()
+
+    if attempts_to_remove.empty:
+        print("\nRepeated-attempt filter removed 0 attempts.")
+        return all_levels_long_df, pd.DataFrame()
+
+    remove_keys = attempts_to_remove[attempt_cols].copy()
+    remove_keys["_remove_repeated_attempt"] = True
+
+    marked_long_df = all_levels_long_df.merge(
+        remove_keys,
+        on=attempt_cols,
+        how="left",
+    )
+
+    repeated_removed_long_df = marked_long_df[
+        marked_long_df["_remove_repeated_attempt"] == True
+    ].drop(columns=["_remove_repeated_attempt"])
+
+    filtered_long_df = marked_long_df[
+        marked_long_df["_remove_repeated_attempt"] != True
+    ].drop(columns=["_remove_repeated_attempt"])
+
+    repeated_discarded_rows: list[dict[str, Any]] = []
+
+    for attempt_key, attempt_df in repeated_removed_long_df.groupby(
+        attempt_cols,
+        dropna=False,
+    ):
+        wide_row = make_wide_level_row(attempt_df)
+
+        key_filter = pd.Series(True, index=attempts_to_remove.index)
+
+        for col, value in zip(attempt_cols, attempt_key):
+            key_filter = key_filter & (attempts_to_remove[col] == value)
+
+        summary_row = attempts_to_remove[key_filter].iloc[0]
+
+        wide_row["discard_reason"] = "repeated_attempt_significantly_worse_than_best"
+        wide_row["n_attempts_same_color"] = summary_row["n_attempts_same_color"]
+        wide_row["best_mean_deltaE2000_same_color"] = summary_row[
+            "best_mean_deltaE2000_same_color"
+        ]
+        wide_row["discarded_attempt_mean_deltaE2000"] = summary_row[
+            "mean_deltaE2000"
+        ]
+        wide_row["difference_from_best_deltaE2000"] = summary_row[
+            "difference_from_best_deltaE2000"
+        ]
+        wide_row["relative_to_best_deltaE2000"] = summary_row[
+            "relative_to_best_deltaE2000"
+        ]
+        wide_row["repeated_filter_absolute_threshold"] = (
+            REPEATED_WORSE_ABSOLUTE_DELTAE2000
+        )
+        wide_row["repeated_filter_relative_threshold"] = (
+            REPEATED_WORSE_RELATIVE_FACTOR
+        )
+
+        repeated_discarded_rows.append(wide_row)
+
+    repeated_discarded_attempts_df = pd.DataFrame(repeated_discarded_rows)
+
+    print(
+        "\nRepeated-attempt filter removed "
+        f"{len(repeated_discarded_attempts_df)} significantly worse repeated attempts."
+    )
+
+    return filtered_long_df, repeated_discarded_attempts_df
+
+
 def create_combined_workbook() -> None:
     """
     Main function:
@@ -560,14 +1360,32 @@ def create_combined_workbook() -> None:
     all_demographics: list[dict[str, Any]] = []
     all_long_rows: list[dict[str, Any]] = []
 
+    empty_files: list[dict[str, Any]] = []
+    discarded_level_attempts_all: list[dict[str, Any]] = []
+
     failed_files: list[tuple[Path, Exception]] = []
 
     for input_file in input_files:
         try:
-            demographics, long_rows = parse_participant_final_results(input_file)
+            demographics, kept_long_rows, discarded_level_attempts, is_empty_file = parse_participant_final_results(input_file)
 
-            if long_rows:
-                participant_levels_df = pd.DataFrame(long_rows)
+            if is_empty_file:
+                empty_files.append(
+                    {
+                        **demographics,
+                        "discard_reason": "empty_file",
+                    }
+                )
+
+            if discarded_level_attempts:
+                discarded_level_attempts_all.extend(discarded_level_attempts)
+
+            # Only add participants to the good Excel if they have kept rows.
+            if not kept_long_rows:
+                continue
+
+            if kept_long_rows:
+                participant_levels_df = pd.DataFrame(kept_long_rows)
 
                 total_level_completions_found = (
                     participant_levels_df[
@@ -626,7 +1444,7 @@ def create_combined_workbook() -> None:
             all_demographics.append(
                 {
                     **demographics,
-                    "total_sublevels_done": len(long_rows),
+                    "total_sublevels_done": len(kept_long_rows),
                     "total_level_completions_found": total_level_completions_found,
                     "max_level_reached": max_level_number_found,
                     "levels_found": levels_found,
@@ -636,7 +1454,7 @@ def create_combined_workbook() -> None:
                 }
             )
 
-            all_long_rows.extend(long_rows)
+            all_long_rows.extend(kept_long_rows)
 
         except Exception as exc:
             failed_files.append((input_file, exc))
@@ -646,6 +1464,15 @@ def create_combined_workbook() -> None:
 
     participant_summary_df = pd.DataFrame(all_demographics)
     all_levels_long_df = pd.DataFrame(all_long_rows)
+
+    all_levels_long_df, repeated_discarded_attempts_df = (
+        remove_significantly_worse_repeated_attempts(all_levels_long_df)
+    )
+
+    if not repeated_discarded_attempts_df.empty:
+        discarded_level_attempts_all.extend(
+            repeated_discarded_attempts_df.to_dict("records")
+        )
 
     # Sort for readability.
     sort_cols = [
@@ -663,7 +1490,7 @@ def create_combined_workbook() -> None:
     all_levels_long_df = all_levels_long_df.sort_values(existing_sort_cols)
 
     # Create a short version:
-    # one row per participant × completed level attempt.
+    # one row per participant x completed level attempt.
     short_group_cols = [
         "participant_uuid",
         "userID",
@@ -694,6 +1521,21 @@ def create_combined_workbook() -> None:
         .groupby(existing_short_group_cols, dropna=False)
         .agg(
             n_final_colors=("final_index", "count"),
+
+            whole_level_duration_ms=("whole_level_duration_ms", "first"),
+            mean_sublevel_duration_ms=("sublevel_duration_ms", "mean"),
+            min_sublevel_duration_ms=("sublevel_duration_ms", "min"),
+            max_sublevel_duration_ms=("sublevel_duration_ms", "max"),
+
+            total_final_selected_colors=("sublevel_final_selected_color_count", "sum"),
+            mean_final_selected_colors=("sublevel_final_selected_color_count", "mean"),
+            min_final_selected_colors=("sublevel_final_selected_color_count", "min"),
+            max_final_selected_colors=("sublevel_final_selected_color_count", "max"),
+
+            total_selected_actions=("sublevel_selected_action_count", "sum"),
+            total_deselected_actions=("sublevel_deselected_action_count", "sum"),
+            total_color_actions=("sublevel_total_color_action_count", "sum"),
+            mean_color_actions=("sublevel_total_color_action_count", "mean"),
 
             mean_deltaE76=("deltaE76", "mean"),
             median_deltaE76=("deltaE76", "median"),
@@ -729,7 +1571,7 @@ def create_combined_workbook() -> None:
     max_level = int(all_levels_long_df["level_number"].max())
 
     # There are 8 real levels. The black 000000 color is treated as tutorial.
-    number_of_level_sheets = max(8, max_level)
+    number_of_level_sheets = max(MAIN_COLOR_LEVELS, max_level)
 
     print(f"Participants processed: {len(participant_summary_df)}")
     print(f"Final result rows found: {len(all_levels_long_df)}")
@@ -807,6 +1649,47 @@ def create_combined_workbook() -> None:
 
     print(f"\nCreated combined Excel file:")
     print(f"  {output_file}")
+
+    empty_files_df = pd.DataFrame(empty_files)
+    discarded_level_attempts_df = pd.DataFrame(discarded_level_attempts_all)
+
+    with pd.ExcelWriter(discarded_output_file, engine="openpyxl") as writer:
+        empty_files_df.to_excel(
+            writer,
+            sheet_name="empty_files",
+            index=False,
+        )
+
+        discarded_level_attempts_df.to_excel(
+            writer,
+            sheet_name="discarded_level_attempts",
+            index=False,
+        )
+
+        workbook = writer.book
+
+        for sheet_name in workbook.sheetnames:
+            ws = workbook[sheet_name]
+            ws.freeze_panes = "A2"
+
+            if ws.max_row > 1 and ws.max_column > 1:
+                ws.auto_filter.ref = ws.dimensions
+
+            for col in ws.columns:
+                col_letter = col[0].column_letter
+
+                max_len = 0
+                for cell in col[:200]:
+                    if cell.value is not None:
+                        max_len = max(max_len, len(str(cell.value)))
+
+                ws.column_dimensions[col_letter].width = min(
+                    max(max_len + 2, 10),
+                    45,
+                )
+
+    print("\nCreated discarded results file:")
+    print(f"  {discarded_output_file}")
 
     if failed_files:
         print("\nSome files failed:")

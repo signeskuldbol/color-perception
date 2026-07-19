@@ -3,6 +3,8 @@ from pathlib import Path
 import pandas as pd
 import matplotlib.pyplot as plt
 
+SUBLEVELS_PER_LEVEL = 6
+MAIN_COLOR_LEVELS = 8
 
 # ============================================================
 # PATH SETUP
@@ -14,7 +16,6 @@ excel_file = project_folder / "excel_files" / "combined_final_results.xlsx"
 plot_folder = project_folder / "plots"
 
 plot_folder.mkdir(parents=True, exist_ok=True)
-
 
 # ============================================================
 # LOAD DATA
@@ -80,6 +81,7 @@ def load_long_data() -> pd.DataFrame:
         "final_index",
         "deltaE76",
         "deltaE2000",
+        "sublevel_chosen_color_count",
     ]
 
     for col in numeric_cols:
@@ -169,7 +171,7 @@ def plot_attempt_count_by_level(df: pd.DataFrame) -> None:
     plot_df = plot_df.dropna(subset=["level_number"])
     plot_df["level_number"] = plot_df["level_number"].astype(int)
 
-    levels = list(range(1, 9))
+    levels = list(range(1, MAIN_COLOR_LEVELS + 1))
 
     # One row per participant/file/level found.
     unique_level_df = plot_df.drop_duplicates(
@@ -279,365 +281,193 @@ def plot_attempt_count_by_level(df: pd.DataFrame) -> None:
 
     save_current_plot("01_found_missing_and_repeated_levels_by_level.png")
 # ============================================================
-# PLOT 2: MEAN DELTA E 2000 BY LEVEL
+# PLOT 2: colors choosen by color
 # ============================================================
-
-def plot_mean_deltaE2000_by_level_boxplot(df: pd.DataFrame) -> None:
+def plot_chosen_colors_heatmap_by_participant(long_df: pd.DataFrame) -> None:
     """
-    Shows the distribution of mean Delta E 2000 for each level.
+    Create one heatmap per participant/file.
 
-    This helps you see whether some color levels generally have
-    larger or smaller color distances.
+    x-axis:
+        color level / attempt
+
+    y-axis:
+        sublevel / final_index
+
+    cell value:
+        number of colors chosen in that sublevel
+
+    This helps show whether a participant clicked through a level
+    without choosing colors.
     """
-    needed = ["level_number", "mean_deltaE2000"]
-
-    if not require_columns(df, needed):
-        return
-
-    plot_df = df[needed].dropna().copy()
-    plot_df["level_number"] = plot_df["level_number"].astype(int)
-
-    levels = sorted(plot_df["level_number"].unique())
-
-    data = [
-        plot_df.loc[
-            plot_df["level_number"] == level,
-            "mean_deltaE2000",
-        ].values
-        for level in levels
+    needed = [
+        "participant_uuid",
+        "source_file",
+        "level_number",
+        "attempt_number",
+        "final_index",
+        "sublevel_chosen_color_count",
     ]
 
-    plt.figure(figsize=(9, 5))
-    plt.boxplot(data, tick_labels=[str(level) for level in levels], showmeans=True)
-
-    plt.title("Mean Delta E 2000 by level")
-    plt.xlabel("Level number")
-    plt.ylabel("Mean Delta E 2000")
-
-    save_current_plot("02_mean_deltaE2000_by_level_boxplot.png")
-
-
-# ============================================================
-# PLOT 3: MEAN DELTA E 76 BY LEVEL
-# ============================================================
-
-def plot_mean_deltaE76_by_level_boxplot(df: pd.DataFrame) -> None:
-    """
-    Same as the Delta E 2000 plot, but using Delta E 76.
-    """
-    needed = ["level_number", "mean_deltaE76"]
-
-    if not require_columns(df, needed):
+    if not require_columns(long_df, needed):
         return
 
-    plot_df = df[needed].dropna().copy()
-    plot_df["level_number"] = plot_df["level_number"].astype(int)
+    plot_df = long_df[needed].copy()
 
-    levels = sorted(plot_df["level_number"].unique())
-
-    data = [
-        plot_df.loc[
-            plot_df["level_number"] == level,
-            "mean_deltaE76",
-        ].values
-        for level in levels
-    ]
-
-    plt.figure(figsize=(9, 5))
-    plt.boxplot(data, tick_labels=[str(level) for level in levels], showmeans=True)
-
-    plt.title("Mean Delta E 76 by level")
-    plt.xlabel("Level number")
-    plt.ylabel("Mean Delta E 76")
-
-    save_current_plot("03_mean_deltaE76_by_level_boxplot.png")
-
-
-# ============================================================
-# PLOT 4: REPEATED ATTEMPTS
-# ============================================================
-
-def plot_attempt_number_distribution(df: pd.DataFrame) -> None:
-    """
-    Shows how many rows are first attempts, second attempts, third attempts, etc.
-
-    This helps you understand how common repeated level attempts are.
-    """
-    needed = ["attempt_number"]
-
-    if not require_columns(df, needed):
-        return
-
-    counts = (
-        df["attempt_number"]
-        .dropna()
-        .astype(int)
-        .value_counts()
-        .sort_index()
+    plot_df["level_number"] = pd.to_numeric(
+        plot_df["level_number"],
+        errors="coerce",
     )
 
-    plt.figure(figsize=(8, 5))
-    plt.bar(counts.index.astype(str), counts.values)
-
-    plt.title("Distribution of repeated level attempts")
-    plt.xlabel("Attempt number")
-    plt.ylabel("Number of completed level attempts")
-
-    save_current_plot("04_attempt_number_distribution.png")
-
-
-# ============================================================
-# PLOT 5: MEAN DELTA E 2000 BY COLOR VISION STATUS
-# ============================================================
-
-def plot_mean_deltaE2000_by_colorblindness(df: pd.DataFrame) -> None:
-    """
-    Compares mean Delta E 2000 by color vision status.
-
-    This is useful for comparing NCV and CVD groups if both are present.
-    """
-    needed = ["colorBlindness", "mean_deltaE2000"]
-
-    if not require_columns(df, needed):
-        return
-
-    plot_df = df[needed].dropna().copy()
-
-    groups = sorted(plot_df["colorBlindness"].astype(str).unique())
-
-    if len(groups) < 2:
-        print("Skipping colorBlindness plot because fewer than 2 groups were found.")
-        return
-
-    data = [
-        plot_df.loc[
-            plot_df["colorBlindness"].astype(str) == group,
-            "mean_deltaE2000",
-        ].values
-        for group in groups
-    ]
-
-    plt.figure(figsize=(9, 5))
-    plt.boxplot(data, tick_labels=groups, showmeans=True)
-
-    plt.title("Mean Delta E 2000 by color vision status")
-    plt.xlabel("Color vision status")
-    plt.ylabel("Mean Delta E 2000")
-    plt.xticks(rotation=30, ha="right")
-
-    save_current_plot("05_mean_deltaE2000_by_colorBlindness_boxplot.png")
-
-
-# ============================================================
-# PLOT 6: MEAN DELTA E 2000 BY EYE COLOR
-# ============================================================
-
-def plot_mean_deltaE2000_by_eye_color(df: pd.DataFrame) -> None:
-    """
-    Compares mean Delta E 2000 by eye color.
-
-    This is useful for checking whether eye-color groups look different.
-    """
-    needed = ["eyeColor", "mean_deltaE2000"]
-
-    if not require_columns(df, needed):
-        return
-
-    plot_df = df[needed].dropna().copy()
-
-    group_counts = plot_df["eyeColor"].astype(str).value_counts()
-
-    # Keep groups with at least 2 observations.
-    valid_groups = sorted(group_counts[group_counts >= 2].index)
-
-    if len(valid_groups) < 2:
-        print("Skipping eyeColor plot because fewer than 2 usable groups were found.")
-        return
-
-    data = [
-        plot_df.loc[
-            plot_df["eyeColor"].astype(str) == group,
-            "mean_deltaE2000",
-        ].values
-        for group in valid_groups
-    ]
-
-    plt.figure(figsize=(10, 5))
-    plt.boxplot(data, tick_labels=valid_groups, showmeans=True)
-
-    plt.title("Mean Delta E 2000 by eye color")
-    plt.xlabel("Eye color")
-    plt.ylabel("Mean Delta E 2000")
-    plt.xticks(rotation=30, ha="right")
-
-    save_current_plot("06_mean_deltaE2000_by_eyeColor_boxplot.png")
-
-
-# ============================================================
-# PLOT 7: MEAN DELTA E 2000 BY BIOLOGICAL SEX
-# ============================================================
-
-def plot_mean_deltaE2000_by_biological_sex(df: pd.DataFrame) -> None:
-    """
-    Compares mean Delta E 2000 by biological sex.
-    """
-    needed = ["biologicalSex", "mean_deltaE2000"]
-
-    if not require_columns(df, needed):
-        return
-
-    plot_df = df[needed].dropna().copy()
-
-    groups = sorted(plot_df["biologicalSex"].astype(str).unique())
-
-    if len(groups) < 2:
-        print("Skipping biologicalSex plot because fewer than 2 groups were found.")
-        return
-
-    data = [
-        plot_df.loc[
-            plot_df["biologicalSex"].astype(str) == group,
-            "mean_deltaE2000",
-        ].values
-        for group in groups
-    ]
-
-    plt.figure(figsize=(8, 5))
-    plt.boxplot(data, tick_labels=groups, showmeans=True)
-
-    plt.title("Mean Delta E 2000 by biological sex")
-    plt.xlabel("Biological sex")
-    plt.ylabel("Mean Delta E 2000")
-    plt.xticks(rotation=30, ha="right")
-
-    save_current_plot("07_mean_deltaE2000_by_biologicalSex_boxplot.png")
-
-
-# ============================================================
-# PLOT 8: AGE VS MEAN DELTA E 2000
-# ============================================================
-
-def plot_age_vs_mean_deltaE2000(df: pd.DataFrame) -> None:
-    """
-    Scatterplot of age against mean Delta E 2000.
-
-    This helps you see whether color distance changes with age.
-    """
-    needed = ["age", "mean_deltaE2000"]
-
-    if not require_columns(df, needed):
-        return
-
-    plot_df = df[needed].dropna().copy()
-
-    if plot_df.empty:
-        print("Skipping age plot because there are no valid age values.")
-        return
-
-    plt.figure(figsize=(8, 5))
-    plt.scatter(plot_df["age"], plot_df["mean_deltaE2000"], alpha=0.7)
-
-    plt.title("Age vs mean Delta E 2000")
-    plt.xlabel("Age")
-    plt.ylabel("Mean Delta E 2000")
-
-    save_current_plot("08_age_vs_mean_deltaE2000_scatter.png")
-
-
-# ============================================================
-# PLOT 9: PARTICIPANT AVERAGE DELTA E 2000
-# ============================================================
-
-def plot_participant_average_deltaE2000_distribution(df: pd.DataFrame) -> None:
-    """
-    Creates a histogram of each participant's average Delta E 2000.
-
-    This helps you check whether some participants are extreme outliers.
-    """
-    needed = ["participant_uuid", "mean_deltaE2000"]
-
-    if not require_columns(df, needed):
-        return
-
-    participant_df = (
-        df[needed]
-        .dropna()
-        .groupby("participant_uuid", dropna=False)
-        .agg(
-            participant_mean_deltaE2000=("mean_deltaE2000", "mean"),
-            n_level_attempts=("mean_deltaE2000", "count"),
-        )
-        .reset_index()
+    plot_df["attempt_number"] = pd.to_numeric(
+        plot_df["attempt_number"],
+        errors="coerce",
     )
 
-    if participant_df.empty:
-        print("Skipping participant histogram because there are no valid values.")
-        return
+    plot_df["final_index"] = pd.to_numeric(
+        plot_df["final_index"],
+        errors="coerce",
+    )
 
-    plt.figure(figsize=(8, 5))
-    plt.hist(participant_df["participant_mean_deltaE2000"], bins=15)
+    plot_df["sublevel_chosen_color_count"] = pd.to_numeric(
+        plot_df["sublevel_chosen_color_count"],
+        errors="coerce",
+    )
 
-    plt.title("Participant average mean Delta E 2000")
-    plt.xlabel("Participant average mean Delta E 2000")
-    plt.ylabel("Number of participants")
+    plot_df = plot_df.dropna(
+        subset=[
+            "participant_uuid",
+            "source_file",
+            "level_number",
+            "attempt_number",
+            "final_index",
+        ]
+    )
 
-    save_current_plot("09_participant_average_deltaE2000_histogram.png")
-
-
-# ============================================================
-# PLOT 10: MEAN DELTA E 2000 BY LEVEL AND COLOR VISION STATUS
-# ============================================================
-
-def plot_level_means_by_colorblindness(df: pd.DataFrame) -> None:
-    """
-    Line plot showing average mean Delta E 2000 across levels,
-    separated by color vision status.
-
-    This can show whether NCV/CVD patterns differ across color levels.
-    """
-    needed = ["level_number", "colorBlindness", "mean_deltaE2000"]
-
-    if not require_columns(df, needed):
-        return
-
-    plot_df = df[needed].dropna().copy()
     plot_df["level_number"] = plot_df["level_number"].astype(int)
+    plot_df["attempt_number"] = plot_df["attempt_number"].astype(int)
+    plot_df["final_index"] = plot_df["final_index"].astype(int)
 
-    summary = (
-        plot_df
-        .groupby(["level_number", "colorBlindness"], dropna=False)
-        .agg(group_mean_deltaE2000=("mean_deltaE2000", "mean"))
-        .reset_index()
+    participant_heatmap_folder = plot_folder / "chosen_colors_heatmaps"
+    participant_heatmap_folder.mkdir(parents=True, exist_ok=True)
+
+    participant_groups = plot_df.groupby(
+        ["participant_uuid", "source_file"],
+        dropna=False,
     )
 
-    groups = sorted(summary["colorBlindness"].astype(str).unique())
+    print(
+        f"\nCreating chosen-color heatmaps for "
+        f"{len(participant_groups)} participant/file groups..."
+    )
 
-    if len(groups) < 2:
-        print("Skipping level/colorBlindness line plot because fewer than 2 groups were found.")
-        return
+    for (participant_uuid, source_file), person_df in participant_groups:
+        person_df = person_df.copy()
 
-    plt.figure(figsize=(9, 5))
-
-    for group in groups:
-        group_df = summary[summary["colorBlindness"].astype(str) == group]
-        group_df = group_df.sort_values("level_number")
-
-        plt.plot(
-            group_df["level_number"],
-            group_df["group_mean_deltaE2000"],
-            marker="o",
-            label=group,
+        person_df["level_attempt_label"] = (
+            "L"
+            + person_df["level_number"].astype(str)
+            + " A"
+            + person_df["attempt_number"].astype(str)
         )
 
-    plt.title("Mean Delta E 2000 by level and color vision status")
-    plt.xlabel("Level number")
-    plt.ylabel("Group mean Delta E 2000")
-    plt.legend(title="Color vision status")
+        attempt_order_df = (
+            person_df[
+                [
+                    "level_number",
+                    "attempt_number",
+                    "level_attempt_label",
+                ]
+            ]
+            .drop_duplicates()
+            .sort_values(["level_number", "attempt_number"])
+        )
 
-    save_current_plot("10_mean_deltaE2000_by_level_and_colorBlindness.png")
+        attempt_labels = attempt_order_df["level_attempt_label"].tolist()
+
+        heatmap_df = (
+            person_df
+            .pivot_table(
+                index="final_index",
+                columns="level_attempt_label",
+                values="sublevel_chosen_color_count",
+                aggfunc="first",
+            )
+            .reindex(
+                index=list(range(SUBLEVELS_PER_LEVEL)),
+                columns=attempt_labels,
+            )
+        )
+
+        if heatmap_df.empty:
+            continue
+
+        figure_width = max(SUBLEVELS_PER_LEVEL, len(attempt_labels) * 0.8)
+
+        plt.figure(figsize=(figure_width, 6))
+
+        plt.imshow(
+            heatmap_df.values,
+            aspect="auto",
+        )
+
+        plt.colorbar(label="Number of colors chosen")
+
+        plt.title(
+            "Number of colors chosen per sublevel and color level\n"
+            f"Participant: {participant_uuid}"
+        )
+
+        plt.xlabel("Color level / attempt")
+        plt.ylabel("Sublevel / final color index")
+
+        plt.xticks(
+            ticks=range(len(attempt_labels)),
+            labels=attempt_labels,
+            rotation=45,
+            ha="right",
+        )
+
+        plt.yticks(
+            ticks=range(SUBLEVELS_PER_LEVEL),
+            labels=[str(i) for i in range(SUBLEVELS_PER_LEVEL)],
+        )
+
+        # Write the number inside each heatmap cell.
+        for y_index in range(heatmap_df.shape[0]):
+            for x_index in range(heatmap_df.shape[1]):
+                value = heatmap_df.iloc[y_index, x_index]
+
+                if pd.notna(value):
+                    label = str(int(value))
+                else:
+                    label = "?"
+
+                plt.text(
+                    x_index,
+                    y_index,
+                    label,
+                    ha="center",
+                    va="center",
+                    fontsize=8,
+                )
+
+        plt.tight_layout()
+
+        filename = (
+            f"participant_{safe_filename(participant_uuid)}"
+            f"__{safe_filename(source_file)}"
+            f"__chosen_colors_heatmap.png"
+        )
+
+        output_path = participant_heatmap_folder / filename
+
+        plt.savefig(output_path, dpi=300)
+        plt.close()
+
+    print(f"Saved chosen-color heatmaps in:\n{participant_heatmap_folder}")
 
 # ============================================================
-# PLOT 11: PR PERSON PLOTS
+# PLOT 3: PR PERSON PLOTS
 # ============================================================
 def plot_each_participant_sublevel_distances(long_df: pd.DataFrame) -> None:
     """
@@ -703,13 +533,13 @@ def plot_each_participant_sublevel_distances(long_df: pd.DataFrame) -> None:
     plot_df["attempt_number"] = plot_df["attempt_number"].astype(int)
     plot_df["final_index"] = plot_df["final_index"].astype(int)
 
-    # x_position places the 8 sublevels of each level next to each other.
-    # Level 1 gets x = 1 to 8
-    # Level 2 gets x = 9 to 16
+    # x_position places the 6 sublevels of each level next to each other.
+    # Level 1 gets x = 1 to 6
+    # Level 2 gets x = 7 to 12
     # ...
-    # Level 8 gets x = 57 to 64
+    # Level 8 gets x = 43 to 48
     plot_df["x_position"] = (
-        (plot_df["level_number"] - 1) * 8
+        (plot_df["level_number"] - 1) * SUBLEVELS_PER_LEVEL
         + plot_df["final_index"]
         + 1
     )
@@ -741,7 +571,7 @@ def plot_each_participant_sublevel_distances(long_df: pd.DataFrame) -> None:
             # Reindex so missing final_index values show as gaps.
             full_index = pd.DataFrame(
                 {
-                    "final_index": list(range(8))
+                    "final_index": list(range(SUBLEVELS_PER_LEVEL))
                 }
             )
 
@@ -754,7 +584,7 @@ def plot_each_participant_sublevel_distances(long_df: pd.DataFrame) -> None:
             attempt_complete["level_number"] = level_number
             attempt_complete["attempt_number"] = attempt_number
             attempt_complete["x_position"] = (
-                (level_number - 1) * 8
+                (level_number - 1) * SUBLEVELS_PER_LEVEL
                 + attempt_complete["final_index"]
                 + 1
             )
@@ -770,7 +600,7 @@ def plot_each_participant_sublevel_distances(long_df: pd.DataFrame) -> None:
             )
 
         # Add vertical lines between levels.
-        for boundary in range(8, 64, 8):
+        for boundary in range(SUBLEVELS_PER_LEVEL, MAIN_COLOR_LEVELS * SUBLEVELS_PER_LEVEL, SUBLEVELS_PER_LEVEL):
             plt.axvline(
                 boundary + 0.5,
                 linestyle="--",
@@ -780,13 +610,13 @@ def plot_each_participant_sublevel_distances(long_df: pd.DataFrame) -> None:
 
         # Label the middle of each level group.
         level_midpoints = [
-            ((level - 1) * 8) + 4.5
-            for level in range(1, 9)
+            ((level - 1) * SUBLEVELS_PER_LEVEL) + ((SUBLEVELS_PER_LEVEL + 1) / 2)
+            for level in range(1, MAIN_COLOR_LEVELS + 1)
         ]
 
         plt.xticks(
             level_midpoints,
-            [f"Level {level}" for level in range(1, 9)],
+            [f"Level {level}" for level in range(1, MAIN_COLOR_LEVELS + 1)],
             rotation=0,
         )
 
@@ -819,7 +649,6 @@ def plot_each_participant_sublevel_distances(long_df: pd.DataFrame) -> None:
         plt.close()
 
     print(f"Saved participant plots in:\n{participant_plot_folder}")
-
 
 # ============================================================
 # OPTIONAL: CREATE SIMPLE SUMMARY EXCEL FILE
@@ -1002,15 +831,7 @@ def main() -> None:
     print(f"Columns found: {list(df.columns)}")
 
     plot_attempt_count_by_level(df)
-    plot_mean_deltaE2000_by_level_boxplot(df)
-    plot_mean_deltaE76_by_level_boxplot(df)
-    plot_attempt_number_distribution(df)
-    plot_mean_deltaE2000_by_colorblindness(df)
-    plot_mean_deltaE2000_by_eye_color(df)
-    plot_mean_deltaE2000_by_biological_sex(df)
-    plot_age_vs_mean_deltaE2000(df)
-    plot_participant_average_deltaE2000_distribution(df)
-    plot_level_means_by_colorblindness(df)
+    plot_chosen_colors_heatmap_by_participant(long_df)
     plot_each_participant_sublevel_distances(long_df)
 
     create_plot_summary_excel(df)
