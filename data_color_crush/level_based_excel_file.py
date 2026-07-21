@@ -1,19 +1,51 @@
 """
-TODO write a proper README.md for this project.
+Color Crush data handler that creates 2 excel files:
+    1. combined_final_results.xlsx
+        Sheets:
+            - participant_summary: one row per participant with demographics and level summary (highest level overview)
+            - all_levels_short: one row per participant per level with summary info 
+            - all_final_colors_long: all data rows for all participants and all levels' sublevels.
+            - level_1 to level_8: one sheet per level with all kept attempts for that level
 
+    2. discarded_results.xlsx
+        Sheets:
+        - empty_files: participant files with no log rows found
+        - discarded_level_attempts: structurally incomplete attempts or attempts removed due to filtering.
+
+
+What this script does:
+- Reads all participant .txt files from the designated folder.
+- Extracts participant demographics when available.
+- Extracts raw gameplay log lines directly from the text files.
+- Sorts all gameplay events by their numeric timestamp, not by Color ID block order (due to unsorted log entries).
+- Ignores the tutorial color block 000000.
+- Detects completed color-level attempts from gamelevelbegun to finalcolors.
+- Keeps structurally valid attempts and only discards structurally incomplete attempts, such as:
+    - no log rows found
+    - a new gamelevelbegun before the previous level reached finalcolors
+    - gamelevelend without finalcolors
+- Converts raw timestamp differences from microseconds to milliseconds.
+- Saves timing information as diagnostic data.
+- Counts selected, deselected, and final selected colors for each sublevel.
+- Calculates Delta E 76 and Delta E 2000 between the base color and each final color.
+- Removes accidental zero-chosen attempts using the final filtering rules:
+    - repeated zero-chosen attempts are removed if another attempt of the same level/color has choices
+    - zero-chosen attempts under 30 seconds are removed
+- Builds participant_summary from the final cleaned data, so it matches the kept result sheets.
+- Writes the cleaned results to combined_final_results.xlsx.
+- Writes empty files and discarded attempts to discarded_results.xlsx.
 
 Expected project structure:
-
-color-perception/
-└── data_color_crush/
-    ├── this script
-    ├── users_22_juni_2026/
-    │   ├── participant_file_1.txt
-    │   ├── participant_file_2.txt
-    │   └── ...
-    └── excel_files/
-        ├── combined_final_results.xlsx
-        └── discarded_results.xlsx
+    color-perception/
+    └── data_color_crush/
+        ├── this script
+        ├── "-USER DATA-"/
+        │   ├── participant_file_1.txt
+        │   ├── participant_file_2.txt
+        │   └── ...
+        └── excel_files/
+            ├── combined_final_results.xlsx
+            └── discarded_results.xlsx
 """
 
 from __future__ import annotations
@@ -40,25 +72,16 @@ output_file = output_folder / "combined_final_results.xlsx"
 
 discarded_output_file = output_folder / "discarded_results.xlsx"
 
-# 5 seconds = 5,000 milliseconds.
-MIN_SUBLEVEL_TIME_MS = 5_000
-
-# Fallback threshold for a whole level attempt.
-# 6 sublevels × 5 seconds = 30 seconds.
-MIN_WHOLE_LEVEL_TIME_MS = 30_000
-
-# For now: discard if a too-fast sublevel has zero chosen colors.
-MIN_COLORS_CHOSEN_PER_SUBLEVEL = 1
-
 EXPECTED_FINAL_COLORS_PER_LEVEL = 6
 
 MAIN_COLOR_LEVELS = 8
-
 # ============================================================
-# ATTEMPT CLEANING SETTINGS
+# FILTERING SETTINGS
 # ============================================================
 
+# attempts with 0 colors choosen where another attempt with the same base color has >0 colors choosen will be removed.
 REMOVE_ZERO_REPEATED_ATTEMPTS = True
+# remove attempts with 0 colors choosen if the attempt took less than 30 seconds.
 REMOVE_FAST_ZERO_ATTEMPTS = True
 
 # 30 seconds = 30,000 milliseconds.
@@ -78,8 +101,6 @@ DEMOGRAPHICS_RE = re.compile(
     r"Subcollection:\s*demographics.*?Data:\s*(\{.*?\})\s*(?=\n\s*Subcollection:|\Z)",
     re.DOTALL,
 )
-
-
 
 # ============================================================
 # LEVEL MAPPING
@@ -382,7 +403,7 @@ def parse_finalcolors_payload(
     """
     Parse a finalcolors payload.
 
-    Expected structure in your data:
+    Expected structure in data:
         8 hex colors
         8 direction/change tuples
         8 Lab-like tuples
@@ -454,14 +475,12 @@ def parse_participant_final_results(
         discarded_level_attempts
         is_empty_file
 
-    Filtering rule:
-        A whole level attempt is discarded if any sublevel has:
-            duration < MIN_SUBLEVEL_TIME_MS
-            AND
-            chosen color count < MIN_COLORS_CHOSEN_PER_SUBLEVEL
-
-    Missing timing is marked as missing. It is not guessed from the last
-    available timestamp.
+    It keeps structurally valid attempts and only discards attempts where
+        the log structure is incomplete, for example:
+            - no log rows found
+            - new gamelevelbegun before previous finalcolors
+            - gamelevelend without finalcolors
+       
     """
     text = path.read_text(encoding="utf-8", errors="replace")
     demographics = parse_demographics(text, path)
@@ -814,13 +833,10 @@ def parse_participant_final_results(
         whole_level_duration_ms = None
 
         if level_start_ms is not None and finalcolors_timestamp_ms is not None:
-            whole_level_duration_ms = finalcolors_timestamp_ms - level_start_ms
+            whole_level_duration_ms = (finalcolors_timestamp_ms - level_start_ms) / 1000 # from microseconds to milliseconds
 
         sublevel_durations: list[int | None] = []
         sublevel_missing_timing: list[bool] = []
-        sublevel_too_fast: list[bool] = []
-        sublevel_too_few_choices: list[bool] = []
-        sublevel_failed_quality: list[bool] = []
 
         for i in range(EXPECTED_FINAL_COLORS_PER_LEVEL):
             duration = None
@@ -831,49 +847,12 @@ def parse_participant_final_results(
                 and sublevel_start_times[i] is not None
                 and sublevel_end_times[i] is not None
             ):
-                duration = sublevel_end_times[i] - sublevel_start_times[i]
+                duration = (sublevel_end_times[i] - sublevel_start_times[i]) / 1000 # from microseconds to milliseconds
 
             sublevel_durations.append(duration)
 
             missing_timing = duration is None
             sublevel_missing_timing.append(missing_timing)
-
-            chosen_count = (
-                sublevel_final_selected_counts[i]
-                if i < len(sublevel_final_selected_counts)
-                else None
-            )
-
-            too_fast = (
-                duration is not None
-                and duration < MIN_SUBLEVEL_TIME_MS
-            )
-
-            too_few_choices = (
-                chosen_count is None
-                or chosen_count < MIN_COLORS_CHOSEN_PER_SUBLEVEL
-            )
-
-            failed_quality = (
-                too_fast
-                and too_few_choices
-            )
-
-            sublevel_too_fast.append(too_fast)
-            sublevel_too_few_choices.append(too_few_choices)
-            sublevel_failed_quality.append(failed_quality)
-
-        valid_durations = [
-            duration
-            for duration in sublevel_durations
-            if duration is not None
-        ]
-
-        min_sublevel_duration_ms = (
-            min(valid_durations)
-            if valid_durations
-            else None
-        )
 
         total_final_selected_colors = sum(
             count
@@ -899,112 +878,7 @@ def parse_participant_final_results(
             if count is not None
         )
 
-        has_missing_sublevel_timing = any(sublevel_missing_timing)
-        has_failed_sublevel_quality = any(sublevel_failed_quality)
-
-        has_whole_level_timing = whole_level_duration_ms is not None
-
-        whole_level_too_fast = (
-            has_whole_level_timing
-            and whole_level_duration_ms < MIN_WHOLE_LEVEL_TIME_MS
-        )
-
-        # Fallback rule:
-        # Only use whole-level timing when sublevel timing is missing.
-        failed_whole_level_fallback_quality = (
-            has_missing_sublevel_timing
-            and whole_level_too_fast
-        )
-
-        discard_reason = ""
-
-        if has_failed_sublevel_quality:
-            discard_reason = "too_fast_and_too_few_colors_chosen"
-
-        elif failed_whole_level_fallback_quality:
-            discard_reason = "whole_level_too_fast_missing_sublevel_timing"
-
-        has_failed_level_quality = (
-            has_failed_sublevel_quality
-            or failed_whole_level_fallback_quality
-        )
-
-        # Discard the entire level attempt if one sublevel fails both rules.
-        if has_failed_level_quality:
-            discarded_row = {
-                **demographics,
-                "discard_reason": discard_reason,
-                "level_number": level_number,
-                "attempt_number": attempt_number,
-                "color_block_id": event["color_block_id"],
-                "base_color": event["base_color"],
-                "level_started_in_color_block_id": event.get("level_started_in_color_block_id"),
-                "level_ended_in_color_block_id": event.get("level_ended_in_color_block_id"),
-                "crossed_color_block_boundary": event.get("crossed_color_block_boundary"),
-                "level_start_file_order": event.get("level_start_file_order"),
-                "finalcolors_file_order": event.get("finalcolors_file_order"),
-                "console_output_count": event.get("console_output_count"),
-                "console_error_count": event.get("console_error_count"),
-                "level_start_ms": event["level_start_ms"],
-                "finalcolors_timestamp_ms": finalcolors_timestamp_ms,
-                "whole_level_duration_ms": whole_level_duration_ms,
-                "whole_level_too_fast": whole_level_too_fast,
-                "failed_whole_level_fallback_quality": failed_whole_level_fallback_quality,
-                "min_sublevel_duration_ms": min_sublevel_duration_ms,
-                "has_missing_sublevel_timing": has_missing_sublevel_timing,
-            }
-
-            for i in range(EXPECTED_FINAL_COLORS_PER_LEVEL):
-                discarded_row[f"sublevel_{i}_duration_ms"] = sublevel_durations[i]
-                discarded_row[f"sublevel_{i}_missing_timing"] = sublevel_missing_timing[i]
-
-                final_selected_count = (
-                    sublevel_final_selected_counts[i]
-                    if i < len(sublevel_final_selected_counts)
-                    else None
-                )
-
-                selected_action_count = (
-                    sublevel_selected_action_counts[i]
-                    if i < len(sublevel_selected_action_counts)
-                    else None
-                )
-
-                deselected_action_count = (
-                    sublevel_deselected_action_counts[i]
-                    if i < len(sublevel_deselected_action_counts)
-                    else None
-                )
-
-                total_action_count = (
-                    sublevel_total_action_counts[i]
-                    if i < len(sublevel_total_action_counts)
-                    else None
-                )
-
-                discarded_row[f"sublevel_{i}_final_selected_color_count"] = final_selected_count
-                discarded_row[f"sublevel_{i}_selected_action_count"] = selected_action_count
-                discarded_row[f"sublevel_{i}_deselected_action_count"] = deselected_action_count
-                discarded_row[f"sublevel_{i}_total_color_action_count"] = total_action_count
-
-                # Keep old name for compatibility with older plotting code.
-                discarded_row[f"sublevel_{i}_chosen_color_count"] = final_selected_count
-                discarded_row[f"sublevel_{i}_too_fast"] = sublevel_too_fast[i]
-                discarded_row[f"sublevel_{i}_too_few_choices"] = sublevel_too_few_choices[i]
-                discarded_row[f"sublevel_{i}_failed_quality"] = sublevel_failed_quality[i]
-
-            for parsed in parsed_final_colors:
-                i = parsed["final_index"]
-
-                discarded_row[f"final_{i}_hex"] = parsed.get("final_hex")
-                discarded_row[f"final_{i}_deltaE76"] = parsed.get("deltaE76")
-                discarded_row[f"final_{i}_deltaE2000"] = parsed.get("deltaE2000")
-
-            discarded_level_attempts.append(discarded_row)
-            continue
-
-        # If the level attempt passes, keep all final-color rows.
-        # Save timing and chosen-color information in the good Excel too.
+        # If the level attempt was structurally complete, keep all final-color rows.
         for parsed in parsed_final_colors:
             final_index = parsed["final_index"]
 
@@ -1016,9 +890,6 @@ def parse_participant_final_results(
             total_color_action_count = None
 
             chosen_color_count = None
-            too_fast = False
-            too_few_choices = False
-            failed_quality = False
 
             if final_index < EXPECTED_FINAL_COLORS_PER_LEVEL:
                 sublevel_duration_ms = sublevel_durations[final_index]
@@ -1037,9 +908,6 @@ def parse_participant_final_results(
                 if final_index < len(sublevel_total_action_counts):
                     total_color_action_count = sublevel_total_action_counts[final_index]
 
-                too_fast = sublevel_too_fast[final_index]
-                too_few_choices = sublevel_too_few_choices[final_index]
-                failed_quality = sublevel_failed_quality[final_index]
 
             kept_long_rows.append(
                 {
@@ -1053,6 +921,7 @@ def parse_participant_final_results(
 
                 "whole_level_duration_ms": whole_level_duration_ms,
                 "sublevel_duration_ms": sublevel_duration_ms,
+                "sublevel_has_missing_timing": sublevel_has_missing_timing,
 
                 "total_final_selected_colors": total_final_selected_colors,
                 "total_selected_actions": total_selected_actions,
@@ -1152,7 +1021,7 @@ def make_wide_level_row(level_df: pd.DataFrame) -> dict[str, Any]:
             "sublevel_total_color_action_count"
         )
         row[f"final_{i}_sublevel_duration_ms"] = r.get("sublevel_duration_ms")
-
+        row[f"final_{i}_sublevel_has_missing_timing"] = r.get("sublevel_has_missing_timing")
     deltaE76_values = pd.to_numeric(level_df["deltaE76"], errors="coerce").dropna()
     deltaE2000_values = pd.to_numeric(level_df["deltaE2000"], errors="coerce").dropna()
 
@@ -1183,6 +1052,107 @@ def make_wide_level_row(level_df: pd.DataFrame) -> dict[str, Any]:
         row["std_deltaE2000"] = None
 
     return row
+
+def create_participant_summary_from_cleaned_data(
+    all_levels_long_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Create participant_summary from the final cleaned long data.
+
+    This makes participant_summary match the data that is actually kept
+    in all_final_colors_long and all_levels_short.
+    """
+    if all_levels_long_df.empty:
+        return pd.DataFrame()
+
+    summary_rows: list[dict[str, Any]] = []
+
+    group_cols = [
+        "participant_uuid",
+        "source_file",
+    ]
+
+    for _, participant_df in all_levels_long_df.groupby(group_cols, dropna=False):
+        first = participant_df.iloc[0]
+
+        level_attempt_df = (
+            participant_df[
+                ["level_number", "base_color", "attempt_number"]
+            ]
+            .drop_duplicates()
+        )
+
+        total_level_completions_found = len(level_attempt_df)
+
+        levels_found_list = sorted(
+            participant_df["level_number"]
+            .dropna()
+            .astype(int)
+            .unique()
+        )
+
+        if levels_found_list:
+            max_level_number_found = max(levels_found_list)
+
+            expected_levels_before_highest = set(
+                range(1, max_level_number_found + 1)
+            )
+
+            actual_levels_found = set(levels_found_list)
+
+            missing_levels_before_highest_list = sorted(
+                expected_levels_before_highest - actual_levels_found
+            )
+        else:
+            max_level_number_found = 0
+            missing_levels_before_highest_list = []
+
+        levels_found = ", ".join(
+            str(level) for level in levels_found_list
+        )
+
+        missing_levels_before_highest = ", ".join(
+            str(level) for level in missing_levels_before_highest_list
+        )
+
+        has_missing_levels_before_highest = (
+            len(missing_levels_before_highest_list) > 0
+        )
+
+        completed_base_colors = ", ".join(
+            sorted(
+                participant_df["base_color"].dropna().unique(),
+                key=lambda color: LEVEL_BY_BASE_COLOR.get(color, 999),
+            )
+        )
+
+        summary_rows.append(
+            {
+                "participant_uuid": first.get("participant_uuid"),
+                "userID": first.get("userID"),
+                "age": first.get("age"),
+                "biologicalSex": first.get("biologicalSex"),
+                "eyeColor": first.get("eyeColor"),
+                "colorBlindness": first.get("colorBlindness"),
+                "Nationality": first.get("Nationality"),
+                "Device_Model": first.get("Device_Model"),
+                "Operating_System": first.get("Operating_System"),
+                "source_file": first.get("source_file"),
+                "levels_completed_from_filename": first.get(
+                    "levels_completed_from_filename"
+                ),
+
+                "total_sublevels_done": len(participant_df),
+                "total_level_completions_found": total_level_completions_found,
+                "max_level_reached": max_level_number_found,
+                "levels_found": levels_found,
+                "missing_levels_before_highest": missing_levels_before_highest,
+                "has_missing_levels_before_highest": has_missing_levels_before_highest,
+                "completed_base_colors": completed_base_colors,
+            }
+        )
+
+    return pd.DataFrame(summary_rows)
 
 def remove_zero_and_fast_attempts(
     all_levels_long_df: pd.DataFrame,
@@ -1386,7 +1356,6 @@ def create_combined_workbook() -> None:
     if not input_files:
         raise SystemExit(f"No .txt files found in: {input_folder}")
 
-    all_demographics: list[dict[str, Any]] = []
     all_long_rows: list[dict[str, Any]] = []
 
     empty_files: list[dict[str, Any]] = []
@@ -1412,77 +1381,7 @@ def create_combined_workbook() -> None:
             # Only add participants to the good Excel if they have kept rows.
             if not kept_long_rows:
                 continue
-
-            if kept_long_rows:
-                participant_levels_df = pd.DataFrame(kept_long_rows)
-
-                total_level_completions_found = (
-                    participant_levels_df[
-                        ["level_number", "base_color", "attempt_number"]
-                    ]
-                    .drop_duplicates()
-                    .shape[0]
-                )
-
-                levels_found_list = sorted(
-                    participant_levels_df["level_number"]
-                    .dropna()
-                    .astype(int)
-                    .unique()
-                )
-
-                max_level_number_found = max(levels_found_list)
-
-                expected_levels_before_highest = set(
-                    range(1, max_level_number_found + 1)
-                )
-
-                actual_levels_found = set(levels_found_list)
-
-                missing_levels_before_highest_list = sorted(
-                    expected_levels_before_highest - actual_levels_found
-                )
-
-                levels_found = ", ".join(
-                    str(level) for level in levels_found_list
-                )
-
-                missing_levels_before_highest = ", ".join(
-                    str(level) for level in missing_levels_before_highest_list
-                )
-
-                has_missing_levels_before_highest = (
-                    len(missing_levels_before_highest_list) > 0
-                )
-
-                completed_base_colors = ", ".join(
-                    sorted(
-                        participant_levels_df["base_color"].dropna().unique(),
-                        key=lambda color: LEVEL_BY_BASE_COLOR.get(color, 999),
-                    )
-                )
-
-            else:
-                total_level_completions_found = 0
-                max_level_number_found = 0
-                completed_base_colors = ""
-                levels_found = ""
-                missing_levels_before_highest = ""
-                has_missing_levels_before_highest = False
-
-            all_demographics.append(
-                {
-                    **demographics,
-                    "total_sublevels_done": len(kept_long_rows),
-                    "total_level_completions_found": total_level_completions_found,
-                    "max_level_reached": max_level_number_found,
-                    "levels_found": levels_found,
-                    "missing_levels_before_highest": missing_levels_before_highest,
-                    "has_missing_levels_before_highest": has_missing_levels_before_highest,
-                    "completed_base_colors": completed_base_colors,
-                }
-            )
-
+                
             all_long_rows.extend(kept_long_rows)
 
         except Exception as exc:
@@ -1491,11 +1390,19 @@ def create_combined_workbook() -> None:
     if not all_long_rows:
         raise SystemExit("No finalcolors results were found in any file.")
 
-    participant_summary_df = pd.DataFrame(all_demographics)
     all_levels_long_df = pd.DataFrame(all_long_rows)
 
+    """Filtering rule:
+    - any repeated attempts with 0 colors choosen where another attempt 
+    with the same base color has >0 colors choosen will be removed.
+    - any levels with 0 colors choosen and a duration of less than 30 seconds will be removed.
+    """
     all_levels_long_df, repeated_discarded_attempts_df = (
         remove_zero_and_fast_attempts(all_levels_long_df)
+    )
+
+    participant_summary_df = create_participant_summary_from_cleaned_data(
+        all_levels_long_df
     )
 
     if not repeated_discarded_attempts_df.empty:
@@ -1681,6 +1588,18 @@ def create_combined_workbook() -> None:
 
     empty_files_df = pd.DataFrame(empty_files)
     discarded_level_attempts_df = pd.DataFrame(discarded_level_attempts_all)
+
+    print("\nDiscard summary:")
+    print(f"  Empty files: {len(empty_files_df)}")
+    print(f"  Total discarded attempts written: {len(discarded_level_attempts_df)}")
+
+    if not discarded_level_attempts_df.empty and "discard_reason" in discarded_level_attempts_df.columns:
+        print("\nDiscard reasons:")
+        print(
+            discarded_level_attempts_df["discard_reason"]
+            .value_counts(dropna=False)
+            .to_string()
+        )
 
     with pd.ExcelWriter(discarded_output_file, engine="openpyxl") as writer:
         empty_files_df.to_excel(
