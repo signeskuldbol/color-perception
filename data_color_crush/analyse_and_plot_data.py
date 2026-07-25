@@ -19,7 +19,38 @@ LEVEL_BY_BASE_COLOR = {
     "704C3C": 8,  # brown
 }
 
+LEVEL_COLORS = {
+    level_number: f"#{base_hex}"
+    for base_hex, level_number in LEVEL_BY_BASE_COLOR.items()
+}
 
+"""
+PLAN:
+Step 1: Descriptive overview
+    Count participants, levels, missing data, age values.
+
+Step 2: Average repeated attempts
+    Make sure each participant contributes equally.
+
+Step 3: Level analysis
+    Compare Delta E 2000 across the 8 color levels.
+
+Step 4: Sublevel analysis
+    Look at performance across the 6 sublevels/final colors.
+
+Step 5: Demographic/group analysis
+    Compare groups such as colorBlindness, biologicalSex, device, etc.
+
+Step 6: Age/regression analysis
+    Check whether age is related to Delta E 2000.
+
+Step 7: Formal tests
+    Use Welch's t-test + Hedges' g for two-group comparisons.
+    Use Mann-Whitney U + rank-biserial as robustness checks.
+
+Step 8: Interpretation
+    Focus on effect sizes, plots, and cautious explanations.
+"""
 # ============================================================
 # PATH SETUP
 # ============================================================
@@ -647,50 +678,37 @@ def plot_attempt_count_by_level(df: pd.DataFrame) -> None:
                 missing_counts.loc[missing_level] += 1
 
     x_positions = list(range(len(levels)))
-    bar_width = 0.4
-
-    found_bar_positions = [
-        x - bar_width / 2
-        for x in x_positions
-    ]
-
-    all_bar_positions = [
-        x + bar_width / 2
-        for x in x_positions
-    ]
+    bar_width = 0.6
 
     plt.figure(figsize=(10, 6))
 
     plt.bar(
-        found_bar_positions,
+        x_positions,
         found_counts.values,
         width=bar_width,
-        label="Level found",
+        color="darkgreen",
+        label="Unique participant attempts",
     )
 
     plt.bar(
-        found_bar_positions,
-        missing_counts.values,
+        x_positions,
+        all_attempt_counts.values-found_counts.values,
         width=bar_width,
         bottom=found_counts.values,
+        color="limegreen",
+        label="Repeated attempts",
+    )
+
+    plt.bar(
+        x_positions,
+        missing_counts.values,
+        width=bar_width,
+        bottom=found_counts.values+all_attempt_counts.values-found_counts.values,
+        color="yellow",
         label="Missing but expected",
     )
 
-    plt.bar(
-        all_bar_positions,
-        all_attempt_counts.values,
-        width=bar_width,
-        label="All attempts including repeats",
-    )
-
-    plt.bar(
-        all_bar_positions,
-        missing_counts.values,
-        width=bar_width,
-        bottom=all_attempt_counts.values,
-    )
-
-    plt.title("Found, missing, and repeated level data by level")
+    plt.title("Level attempts pr. level")
     plt.xlabel("Level number")
     plt.ylabel("Count")
     plt.xticks(
@@ -1187,12 +1205,15 @@ def plot_age_vs_performance_per_color(
             print(f"Skipping level {level} age plot: no data.")
             continue
 
+        level_color = LEVEL_COLORS.get(level, "grey")
+
         plt.figure(figsize=(8, 6))
 
         plt.scatter(
             level_df["age"],
             level_df["mean_deltaE2000"],
             alpha=0.7,
+            color=level_color,
         )
 
         if level_df["age"].nunique() >= 2 and len(level_df) >= 3:
@@ -1214,6 +1235,7 @@ def plot_age_vs_performance_per_color(
                 x_values,
                 y_values,
                 linewidth=2,
+                color=level_color,
             )
 
             plt.title(
@@ -1288,41 +1310,69 @@ def plot_mean_deltaE2000_by_level(
         print("Skipping mean Delta E plot: no usable data.")
         return
 
-    level_summary = (
-        plot_df
-        .groupby("level_number", dropna=False)
-        .agg(
-            mean_deltaE2000=(
-                "mean_deltaE2000",
-                "mean",
-            ),
-            median_deltaE2000=(
-                "mean_deltaE2000",
-                "median",
-            ),
-            std_deltaE2000=(
-                "mean_deltaE2000",
-                "std",
-            ),
-            n_participant_files=(
-                "mean_deltaE2000",
-                "count",
-            ),
-        )
-        .reset_index()
-        .sort_values("level_number")
-    )
+    levels_sorted = sorted(plot_df["level_number"].unique())
+
+    data_by_level = [
+        plot_df.loc[
+            plot_df["level_number"] == level,
+            "mean_deltaE2000",
+        ].values
+        for level in levels_sorted
+    ]
 
     plt.figure(figsize=(10, 6))
 
-    plt.bar(
-        level_summary["level_number"].astype(str),
-        level_summary["mean_deltaE2000"],
+    box_parts = plt.boxplot(
+        data_by_level,
+        tick_labels=[str(level) for level in levels_sorted],
+        showmeans=True,
+        zorder=2,
     )
 
-    plt.title("Mean Delta E 2000 by color level")
+    jitter_strength = 0.00
+
+    for i, level in enumerate(levels_sorted, start=1):
+        values = data_by_level[i - 1]
+
+        if len(values) == 0:
+            continue
+
+        x_jitter = i + np.random.uniform(
+            -jitter_strength,
+            jitter_strength,
+            size=len(values),
+        )
+
+        scatter_handle = plt.scatter(
+            x_jitter,
+            values,
+            alpha=0.5,
+            s=20,
+            color=LEVEL_COLORS.get(level, "grey"),
+            zorder=1,
+        )
+
+    legend_handles = [
+        box_parts["medians"][0],
+        box_parts["means"][0],
+        box_parts["boxes"][0],
+        box_parts["fliers"][0],
+        scatter_handle,
+    ]
+
+    legend_labels = [
+        "Median",
+        "Mean",
+        "IQR (25th-75th percentile)",
+        "Outliers (beyond 1.5xIQR)",
+        "Individual participants",
+    ]
+
+    plt.legend(legend_handles, legend_labels, loc="best")
+
+    plt.title("Spread of mean Delta E 2000 by color level")
     plt.xlabel("Level number")
-    plt.ylabel("Mean Delta E 2000")
+    plt.ylabel("Mean Delta E 2000 (per participant)")
 
     save_current_plot("05_mean_deltaE2000_by_level.png")
 
@@ -1377,40 +1427,518 @@ def plot_duration_by_level(
         plot_df["whole_level_duration_ms"] / 1000
     )
 
-    level_summary = (
-        plot_df
-        .groupby("level_number", dropna=False)
-        .agg(
-            mean_whole_level_duration_s=(
-                "whole_level_duration_s",
-                "mean",
-            ),
-            median_whole_level_duration_s=(
-                "whole_level_duration_s",
-                "median",
-            ),
-            n_participant_files=(
-                "whole_level_duration_s",
-                "count",
-            ),
-        )
-        .reset_index()
-        .sort_values("level_number")
-    )
+    levels_sorted = sorted(plot_df["level_number"].unique())
+
+    data_by_level = [
+        plot_df.loc[
+            plot_df["level_number"] == level,
+            "whole_level_duration_s",
+        ].values
+        for level in levels_sorted
+    ]
 
     plt.figure(figsize=(10, 6))
 
-    plt.bar(
-        level_summary["level_number"].astype(str),
-        level_summary["mean_whole_level_duration_s"],
+    box_parts = plt.boxplot(
+        data_by_level,
+        tick_labels=[str(level) for level in levels_sorted],
+        showmeans=True,
+        zorder=2,
     )
 
-    plt.title("Mean whole-level duration by color level")
+    jitter_strength = 0.00
+
+    for i, level in enumerate(levels_sorted, start=1):
+        values = data_by_level[i - 1]
+
+        if len(values) == 0:
+            continue
+
+        x_jitter = i + np.random.uniform(
+            -jitter_strength,
+            jitter_strength,
+            size=len(values),
+        )
+
+        scatter_handle = plt.scatter(
+            x_jitter,
+            values,
+            alpha=0.5,
+            s=20,
+            color=LEVEL_COLORS.get(level, "grey"),
+            zorder=1,
+        )
+
+    legend_handles = [
+        box_parts["medians"][0],
+        box_parts["means"][0],
+        box_parts["boxes"][0],
+        box_parts["fliers"][0],
+        scatter_handle,
+    ]
+
+    legend_labels = [
+        "Median",
+        "Mean",
+        "IQR (25th-75th percentile)",
+        "Outliers (beyond 1.5xIQR)",
+        "Individual participants",
+    ]
+
+    plt.legend(legend_handles, legend_labels, loc="best")
+    plt.ylim(ymin=0)
+
+    plt.title("Spread of whole-level duration by color level")
     plt.xlabel("Level number")
-    plt.ylabel("Mean duration [s]")
+    plt.ylabel("Duration [s] (per participant)")
 
     save_current_plot("06_mean_duration_by_level.png")
 
+# ============================================================
+# PLOT 7: group overview plots (demographics, etc.)
+# ============================================================
+
+def plot_participant_counts_by_group(
+    df: pd.DataFrame,
+) -> None:
+    """
+    Plot the number of participants in each demographic group:
+        - eye color
+        - age bin
+        - sex
+        - color blindness
+        - Nationality
+
+    This function should use participant_level_df (repeated attempts
+    already averaged). Participants are de-duplicated by
+    participant_uuid + source_file, since participant_level_df has one
+    row per participant per level, not one row per participant overall.
+    """
+    needed = ["source_file"]
+
+    if not require_columns(df, needed):
+        return
+
+    df = df.copy()
+
+    if "participant_uuid" in df.columns:
+        df["participant_file_id"] = (
+            df["participant_uuid"].astype(str)
+            + "__"
+            + df["source_file"].astype(str)
+        )
+    else:
+        df["participant_file_id"] = df["source_file"].astype(str)
+
+    group_plot_folder = plot_folder / "group_overview"
+    group_plot_folder.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    # ------------------------------------------------------
+    # Eye color
+    # ------------------------------------------------------
+    if "eyeColor" in df.columns:
+        eye_color_df = (
+            df[["participant_file_id", "eyeColor"]]
+            .drop_duplicates()
+            .dropna(subset=["eyeColor"])
+        )
+
+        if not eye_color_df.empty:
+            counts = (
+                eye_color_df
+                .groupby("eyeColor", dropna=False)["participant_file_id"]
+                .nunique()
+                .sort_index()
+            )
+
+            plt.figure(figsize=(8, 6))
+            plt.bar(counts.index.astype(str), counts.values)
+            plt.title("Participant count by eye color")
+            plt.xlabel("Eye color")
+            plt.ylabel("Number of participants")
+            plt.xticks(rotation=45, ha="right")
+            plt.tight_layout()
+
+            output_path = (
+                group_plot_folder / "07_participant_count_by_eye_color.png"
+            )
+            plt.savefig(output_path, dpi=300)
+            plt.close()
+            print(f"Saved: {output_path}")
+        else:
+            print("Skipping eye color plot: no usable data.")
+    else:
+        print("Skipping eye color plot: column not found.")
+
+    # ------------------------------------------------------
+    # Age bins
+    # ------------------------------------------------------
+    if "age" in df.columns:
+        age_df = (
+            df[["participant_file_id", "age"]]
+            .drop_duplicates()
+            .copy()
+        )
+        age_df["age"] = pd.to_numeric(age_df["age"], errors="coerce")
+        age_df = age_df.dropna(subset=["age"])
+
+        if not age_df.empty:
+            age_bins = [0, 19, 29, 39, 49, 120]
+            age_labels = ["<=19", "20-29", "30-39", "40-49", "50+"]
+
+            age_df["age_bin"] = pd.cut(
+                age_df["age"],
+                bins=age_bins,
+                labels=age_labels,
+                right=True,
+            )
+
+            counts = (
+                age_df
+                .groupby("age_bin", dropna=False)["participant_file_id"]
+                .nunique()
+                .reindex(age_labels, fill_value=0)
+            )
+
+            plt.figure(figsize=(8, 6))
+            plt.bar(counts.index.astype(str), counts.values)
+            plt.title("Participant count by age group")
+            plt.xlabel("Age group")
+            plt.ylabel("Number of participants")
+            plt.tight_layout()
+
+            output_path = (
+                group_plot_folder / "07_participant_count_by_age_group.png"
+            )
+            plt.savefig(output_path, dpi=300)
+            plt.close()
+            print(f"Saved: {output_path}")
+        else:
+            print("Skipping age group plot: no usable age data.")
+    else:
+        print("Skipping age group plot: column not found.")
+
+    # ------------------------------------------------------
+    # Sex
+    # ------------------------------------------------------
+    if "biologicalSex" in df.columns:
+        sex_df = (
+            df[["participant_file_id", "biologicalSex"]]
+            .drop_duplicates()
+            .dropna(subset=["biologicalSex"])
+        )
+
+        if not sex_df.empty:
+            counts = (
+                sex_df
+                .groupby("biologicalSex", dropna=False)["participant_file_id"]
+                .nunique()
+                .sort_index()
+            )
+
+            plt.figure(figsize=(8, 6))
+            plt.bar(counts.index.astype(str), counts.values)
+            plt.title("Participant count by sex")
+            plt.xlabel("Sex")
+            plt.ylabel("Number of participants")
+            plt.xticks(rotation=45, ha="right")
+            plt.tight_layout()
+
+            output_path = (
+                group_plot_folder / "07_participant_count_by_sex.png"
+            )
+            plt.savefig(output_path, dpi=300)
+            plt.close()
+            print(f"Saved: {output_path}")
+        else:
+            print("Skipping sex plot: no usable data.")
+    else:
+        print("Skipping sex plot: column not found.")
+
+    # ------------------------------------------------------
+    # Color blindness
+    # ------------------------------------------------------
+    if "colorBlindness" in df.columns:
+        color_blindness_df = (
+            df[["participant_file_id", "colorBlindness"]]
+            .drop_duplicates()
+            .dropna(subset=["colorBlindness"])
+        )
+
+        if not color_blindness_df.empty:
+            counts = (
+                color_blindness_df
+                .groupby("colorBlindness", dropna=False)["participant_file_id"]
+                .nunique()
+                .sort_index()
+            )
+
+            plt.figure(figsize=(8, 6))
+            plt.bar(counts.index.astype(str), counts.values)
+            plt.title("Participant count by color blindness status")
+            plt.xlabel("Color blindness status")
+            plt.ylabel("Number of participants")
+            plt.xticks(rotation=45, ha="right")
+            plt.tight_layout()
+
+            output_path = (
+                group_plot_folder / "07_participant_count_by_color_blindness.png"
+            )
+            plt.savefig(output_path, dpi=300)
+            plt.close()
+            print(f"Saved: {output_path}")
+        else:
+            print("Skipping color blindness plot: no usable data.")
+    else:
+        print("Skipping color blindness plot: column not found.")
+
+    # ------------------------------------------------------
+    # Nationality
+    # ------------------------------------------------------
+    if "Nationality" in df.columns:
+        nationality_df = (
+            df[["participant_file_id", "Nationality"]]
+            .drop_duplicates()
+            .dropna(subset=["Nationality"])
+        )
+
+        if not nationality_df.empty:
+            counts = (
+                nationality_df
+                .groupby("Nationality", dropna=False)["participant_file_id"]
+                .nunique()
+                .sort_index()
+            )
+
+            plt.figure(figsize=(8, 6))
+            plt.bar(counts.index.astype(str), counts.values)
+            plt.title("Participant count by nationality")
+            plt.xlabel("Nationality")
+            plt.ylabel("Number of participants")
+            plt.xticks(rotation=45, ha="right")
+            plt.tight_layout()
+
+            output_path = (
+                group_plot_folder / "07_participant_count_by_nationality.png"
+            )
+            plt.savefig(output_path, dpi=300)
+            plt.close()
+            print(f"Saved: {output_path}")
+        else:
+            print("Skipping nationality plot: no usable data.")
+    else:
+        print("Skipping nationality plot: column not found.")
+
+
+# ============================================================
+# PLOT 8: spiderwebs pr participant, pr color level
+# ============================================================
+# ============================================================
+# PLOT 8: spiderwebs pr participant, pr color level
+# ============================================================
+
+# Fixed compass angle (in the same order as DIRECTION_AXIS_LABELS),
+# in degrees, measured clockwise from the top 
+DIRECTION_AXIS_ANGLES_DEG = {
+    "U+": 90,
+    "L1+": 45,
+    "V+": 0,
+    "L2+": 315,
+    "U-": 270,
+    "L1-": 225,
+    "V-": 180,
+    "L2-": 135,
+}
+
+
+def plot_compass_spiderweb_by_participant_level(
+    df: pd.DataFrame,
+) -> None:
+    """
+    Create one spiderweb (radar) plot per participant/source file per
+    color level per attempt, showing the 8 compass-direction magnitudes
+    logged in the finalcolors payload.
+
+    This function should use the attempt-level dataframe (all_levels_short),
+    not the averaged participant-level dataframe, so repeated attempts
+    are shown individually rather than blurred together.
+    """
+    magnitude_columns = [
+        col for col in df.columns
+        if col.startswith("dir_") and col.endswith("_magnitude")
+    ]
+
+    if not magnitude_columns:
+        print(
+            "Skipping compass spiderweb plots: no dir_*_magnitude "
+            "columns found. Re-run the Excel export script with the "
+            "compass-direction parsing added."
+        )
+        return
+
+    needed = [
+        "source_file",
+        "level_number",
+        "attempt_number",
+    ] + magnitude_columns
+
+    if not require_columns(df, needed):
+        return
+
+    plot_df = df[needed].copy()
+
+    if "participant_uuid" in df.columns:
+        plot_df["participant_uuid"] = df["participant_uuid"]
+    else:
+        plot_df["participant_uuid"] = "missing_uuid"
+
+    plot_df["level_number"] = pd.to_numeric(
+        plot_df["level_number"],
+        errors="coerce",
+    )
+    plot_df["attempt_number"] = pd.to_numeric(
+        plot_df["attempt_number"],
+        errors="coerce",
+    )
+
+    plot_df = plot_df.dropna(
+        subset=[
+            "source_file",
+            "level_number",
+            "attempt_number",
+        ]
+    )
+
+    plot_df["level_number"] = plot_df["level_number"].astype(int)
+    plot_df["attempt_number"] = plot_df["attempt_number"].astype(int)
+
+    # Extract axis label from each column name, e.g.
+    # "dir_2_V+_magnitude" -> "V+"
+    axis_by_column = {}
+
+    for col in magnitude_columns:
+        parts = col.split("_")
+        # dir, <index>, <label...>, magnitude
+        axis_label = "_".join(parts[2:-1])
+        axis_by_column[col] = axis_label
+
+    # Order axes by their fixed compass angle so the spider is drawn
+    # in visual clockwise order, not payload order.
+    ordered_columns = sorted(
+        magnitude_columns,
+        key=lambda col: -DIRECTION_AXIS_ANGLES_DEG.get(
+            axis_by_column[col], 0
+        ),
+    )
+
+    axis_labels = [axis_by_column[col] for col in ordered_columns]
+    axis_angles_rad = [
+        np.deg2rad(DIRECTION_AXIS_ANGLES_DEG.get(label, 0))
+        for label in axis_labels
+    ]
+
+    spiderweb_folder = plot_folder / "compass_spiderwebs"
+    spiderweb_folder.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    participant_groups = plot_df.groupby(
+        [
+            "participant_uuid",
+            "source_file",
+            "level_number",
+            "attempt_number",
+        ],
+        dropna=False,
+    )
+
+    print(
+        f"\nCreating compass spiderweb plots for "
+        f"{len(participant_groups)} participant/level/attempt groups..."
+    )
+
+    for (
+        participant_uuid,
+        source_file,
+        level_number,
+        attempt_number,
+    ), attempt_df in participant_groups:
+        row = attempt_df.iloc[0]
+
+        magnitudes = [
+            row.get(col, 0) or 0
+            for col in ordered_columns
+        ]
+
+        # Close the loop for the plot.
+        angles_plot = axis_angles_rad + [axis_angles_rad[0]]
+        magnitudes_plot = magnitudes + [magnitudes[0]]
+
+        level_color = LEVEL_COLORS.get(level_number, "grey")
+
+        fig = plt.figure(figsize=(7, 7))
+        ax = fig.add_subplot(111, projection="polar")
+
+        ax.set_theta_zero_location("N")
+        ax.set_theta_direction(-1)
+        ax.set_ylim(0, 1.0)
+        ax.set_rlabel_position(-90)
+
+        ax.plot(
+            angles_plot,
+            magnitudes_plot,
+            color=level_color,
+            linewidth=2,
+        )
+        ax.fill(
+            angles_plot,
+            magnitudes_plot,
+            color=level_color,
+            alpha=0.3,
+        )
+
+        ax.set_xticks(axis_angles_rad)
+        ax.set_xticklabels(axis_labels)
+
+        fig.suptitle(
+            "Color Magnitudes",
+            fontsize=16,
+            fontweight="bold",
+        )
+        ax.set_title(
+            f"Level {level_number}, attempt {attempt_number}",
+            fontsize=10,
+        )
+
+        participant_folder = (
+            spiderweb_folder
+            / f"participant_{safe_filename(str(participant_uuid))}"
+        )
+        participant_folder.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        filename = (
+            f"{safe_filename(str(source_file))}"
+            f"__level{level_number}_attempt{attempt_number}"
+            f"__compass_spiderweb.png"
+        )
+
+        output_path = participant_folder / filename
+
+        plt.tight_layout()
+        plt.savefig(
+            output_path,
+            dpi=300,
+        )
+        plt.close()
+
+    print(f"Saved compass spiderweb plots in:\n{spiderweb_folder}")
 
 # ============================================================
 # MAIN
@@ -1492,6 +2020,8 @@ def main() -> None:
     plot_age_vs_performance_per_color(participant_level_df)
     plot_mean_deltaE2000_by_level(participant_level_df)
     plot_duration_by_level(participant_level_df)
+    plot_participant_counts_by_group(participant_level_df)
+    plot_compass_spiderweb_by_participant_level(attempt_level_df)
 
     print("\nDone.")
     print(f"Plots were saved in:\n{plot_folder}")

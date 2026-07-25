@@ -75,6 +75,23 @@ discarded_output_file = output_folder / "discarded_results.xlsx"
 EXPECTED_FINAL_COLORS_PER_LEVEL = 6
 
 MAIN_COLOR_LEVELS = 8
+
+# The finalcolors payload logs 8 entries per level attempt: one for each
+# of 8 fixed compass directions, regardless of how many sublevels (6)
+# were actually played. These describe how far the participant's overall
+# choices drifted from the base color along each compass direction.
+EXPECTED_DIRECTIONS_PER_LEVEL = 8
+
+DIRECTION_AXIS_LABELS = [
+    "U+",   # index 0: (+x, 0)
+    "L1+",  # index 1: (+x, +y)
+    "V+",   # index 2: (0, +y)
+    "L2+",  # index 3: (-x, +y)
+    "U-",   # index 4: (-x, 0)
+    "L1-",  # index 5: (-x, -y)
+    "V-",   # index 6: (0, -y)
+    "L2-",  # index 7: (+x, -y)
+]
 # ============================================================
 # FILTERING SETTINGS
 # ============================================================
@@ -84,7 +101,7 @@ REMOVE_ZERO_REPEATED_ATTEMPTS = True
 # remove attempts with 0 colors choosen if the attempt took less than 30 seconds.
 REMOVE_FAST_ZERO_ATTEMPTS = True
 # remove ALL attempts with 0 colors choosen, regardless of timing or repetition.
-REMOVE_ALL_ZERO_CHOSEN_ATTEMPTS = False
+REMOVE_ALL_ZERO_CHOSEN_ATTEMPTS = True
 
 # 30 seconds = 30,000 milliseconds.
 FAST_ZERO_ATTEMPT_MAX_TIME_MS = 30_000
@@ -104,6 +121,13 @@ DEMOGRAPHICS_RE = re.compile(
     re.DOTALL,
 )
 
+DIRECTION_TUPLE_RE = re.compile(
+    r"\(\s*(-?\d+\.\d+)\s*;\s*(-?\d+\.\d+)\s*;\s*(-?\d+\.\d+)\s*\)"
+)
+
+LOGGED_LAB_TUPLE_RE = re.compile(
+    r"\(\s*(-?\d+,\d+)\s*;\s*(-?\d+,\d+)\s*;\s*(-?\d+,\d+)\s*\)"
+)
 # ============================================================
 # LEVEL MAPPING
 # ============================================================
@@ -126,6 +150,86 @@ TUTORIAL_COLORS = {
 # ============================================================
 # HELPER FUNCTIONS
 # ============================================================
+def parse_comma_decimal(value: str) -> float | None:
+    """
+    Convert a comma-decimal number like '85,695' to a float like 85.695.
+    """
+    try:
+        return float(value.replace(",", "."))
+    except ValueError:
+        return None
+
+
+def parse_compass_directions(payload: str) -> list[dict[str, Any]]:
+    """
+    Parse the 8 fixed compass-direction entries from a finalcolors payload.
+
+    Each entry has:
+        - hex color for that compass position
+        - direction_x, direction_y, direction_z (period-decimal tuple,
+          as logged directly by the game)
+        - direction_magnitude (sqrt(x^2 + y^2 + z^2))
+        - logged_lab_L, logged_lab_a, logged_lab_b (comma-decimal tuple,
+          as logged directly by the game -- separate from the Lab values
+          we compute ourselves from the hex color elsewhere)
+        - axis_label (best-guess compass label; see DIRECTION_AXIS_LABELS)
+
+    Returns a list of up to EXPECTED_DIRECTIONS_PER_LEVEL dicts, one per
+    compass direction, in payload order.
+    """
+    hex_colors = re.findall(r"\b[A-Fa-f0-9]{6}\b", payload)
+    direction_tuples = DIRECTION_TUPLE_RE.findall(payload)
+    logged_lab_tuples = LOGGED_LAB_TUPLE_RE.findall(payload)
+
+    n = EXPECTED_DIRECTIONS_PER_LEVEL
+
+    rows: list[dict[str, Any]] = []
+
+    for i in range(n):
+        entry_hex = hex_colors[i].upper() if i < len(hex_colors) else None
+
+        direction_x = direction_y = direction_z = None
+        direction_magnitude = None
+
+        if i < len(direction_tuples):
+            x_str, y_str, z_str = direction_tuples[i]
+            direction_x = float(x_str)
+            direction_y = float(y_str)
+            direction_z = float(z_str)
+            direction_magnitude = float(
+                np.sqrt(direction_x**2 + direction_y**2 + direction_z**2)
+            )
+
+        logged_lab_L = logged_lab_a = logged_lab_b = None
+
+        if i < len(logged_lab_tuples):
+            L_str, a_str, b_str = logged_lab_tuples[i]
+            logged_lab_L = parse_comma_decimal(L_str)
+            logged_lab_a = parse_comma_decimal(a_str)
+            logged_lab_b = parse_comma_decimal(b_str)
+
+        axis_label = (
+            DIRECTION_AXIS_LABELS[i]
+            if i < len(DIRECTION_AXIS_LABELS)
+            else f"dir_{i}"
+        )
+
+        rows.append(
+            {
+                "direction_index": i,
+                "axis_label": axis_label,
+                "hex": entry_hex,
+                "direction_x": direction_x,
+                "direction_y": direction_y,
+                "direction_z": direction_z,
+                "direction_magnitude": direction_magnitude,
+                "logged_lab_L": logged_lab_L,
+                "logged_lab_a": logged_lab_a,
+                "logged_lab_b": logged_lab_b,
+            }
+        )
+
+    return rows
 
 def load_json_object(text: str) -> dict[str, Any] | None:
     """Load a JSON object safely."""
@@ -489,6 +593,7 @@ def parse_participant_final_results(
 
     level_attempt_events: list[dict[str, Any]] = []
     kept_long_rows: list[dict[str, Any]] = []
+    kept_compass_rows: list[dict[str, Any]] = []
     discarded_level_attempts: list[dict[str, Any]] = []
 
     log_rows = build_combined_log_stream(text)
@@ -820,6 +925,31 @@ def parse_participant_final_results(
             event["base_color"],
         )
 
+        compass_entries = parse_compass_directions(event["payload"])
+
+        compass_row: dict[str, Any] = {
+            "participant_uuid": demographics.get("participant_uuid"),
+            "source_file": demographics.get("source_file"),
+            "level_number": level_number,
+            "attempt_number": attempt_number,
+            "base_color": event["base_color"],
+        }
+
+        for entry in compass_entries:
+            i = entry["direction_index"]
+            prefix = f"dir_{i}_{entry['axis_label']}"
+
+            compass_row[f"{prefix}_hex"] = entry["hex"]
+            compass_row[f"{prefix}_x"] = entry["direction_x"]
+            compass_row[f"{prefix}_y"] = entry["direction_y"]
+            compass_row[f"{prefix}_z"] = entry["direction_z"]
+            compass_row[f"{prefix}_magnitude"] = entry["direction_magnitude"]
+            compass_row[f"{prefix}_logged_lab_L"] = entry["logged_lab_L"]
+            compass_row[f"{prefix}_logged_lab_a"] = entry["logged_lab_a"]
+            compass_row[f"{prefix}_logged_lab_b"] = entry["logged_lab_b"]
+
+        kept_compass_rows.append(compass_row)
+
         sublevel_start_times = event["sublevel_start_times"]
         sublevel_end_times = event["sublevel_end_times"]
 
@@ -946,7 +1076,7 @@ def parse_participant_final_results(
         and len(discarded_level_attempts) == 0
     )
 
-    return demographics, kept_long_rows, discarded_level_attempts, is_empty_file
+    return demographics, kept_long_rows, kept_compass_rows, discarded_level_attempts, is_empty_file
 
 def make_wide_level_row(level_df: pd.DataFrame) -> dict[str, Any]:
     """
@@ -1370,6 +1500,7 @@ def create_combined_workbook() -> None:
         raise SystemExit(f"No .txt files found in: {input_folder}")
 
     all_long_rows: list[dict[str, Any]] = []
+    all_compass_rows: list[dict[str, Any]] = []
 
     empty_files: list[dict[str, Any]] = []
     discarded_level_attempts_all: list[dict[str, Any]] = []
@@ -1378,7 +1509,7 @@ def create_combined_workbook() -> None:
 
     for input_file in input_files:
         try:
-            demographics, kept_long_rows, discarded_level_attempts, is_empty_file = parse_participant_final_results(input_file)
+            demographics, kept_long_rows, kept_compass_rows, discarded_level_attempts, is_empty_file = parse_participant_final_results(input_file)
 
             if is_empty_file:
                 empty_files.append(
@@ -1396,7 +1527,7 @@ def create_combined_workbook() -> None:
                 continue
                 
             all_long_rows.extend(kept_long_rows)
-
+            all_compass_rows.extend(kept_compass_rows)
         except Exception as exc:
             failed_files.append((input_file, exc))
 
@@ -1413,6 +1544,27 @@ def create_combined_workbook() -> None:
     all_levels_long_df, repeated_discarded_attempts_df = (
         remove_zero_and_fast_attempts(all_levels_long_df)
     )
+
+    merge_keys = [
+        "participant_uuid",
+        "source_file",
+        "level_number",
+        "attempt_number",
+        "base_color",
+    ]
+
+    all_compass_df = pd.DataFrame(all_compass_rows)
+
+    if not all_compass_df.empty:
+        valid_attempt_keys_df = all_levels_long_df[merge_keys].drop_duplicates()
+
+        all_compass_df = all_compass_df.merge(
+            valid_attempt_keys_df,
+            on=merge_keys,
+            how="inner",
+        )
+
+    print(f"Compass direction rows kept: {len(all_compass_df)}")
 
     participant_summary_df = create_participant_summary_from_cleaned_data(
         all_levels_long_df
@@ -1500,6 +1652,18 @@ def create_combined_workbook() -> None:
         )
         .reset_index()
     )
+
+    if not all_compass_df.empty:
+        existing_merge_keys = [
+            col for col in merge_keys if col in all_levels_short_df.columns
+        ]
+
+        all_levels_short_df = all_levels_short_df.merge(
+            all_compass_df,
+            on=existing_merge_keys,
+            how="left",
+        )
+
     # order sheet:
     # level first, then participant, then repeated attempts.
     short_sort_cols = [
@@ -1563,6 +1727,17 @@ def create_combined_workbook() -> None:
                     wide_rows.append(make_wide_level_row(participant_level_df))
 
             level_wide_df = pd.DataFrame(wide_rows)
+
+            if not level_wide_df.empty and not all_compass_df.empty:
+                existing_merge_keys = [
+                    col for col in merge_keys if col in level_wide_df.columns
+                ]
+
+                level_wide_df = level_wide_df.merge(
+                    all_compass_df,
+                    on=existing_merge_keys,
+                    how="left",
+                )
 
             sheet_name = safe_sheet_name(f"level_{level_number}")
 
