@@ -9,6 +9,7 @@ This project consists of 2 files:
 Start by opening "create_excel_files_and_sort_data" search for "TODO" and update the folder name for the raw data folder. 
 
 Expected project structure:
+
     color-perception/
     └── data_color_crush/
         ├── create_excel_files_and_sort_data
@@ -21,12 +22,13 @@ Expected project structure:
             └── discarded_results.xlsx
 
 By running the script the following is created:
+
     1. combined_final_results.xlsx
         Sheets:
-            - participant_summary: one row per participant with demographics and level summary (highest level overview)
-            - all_levels_short: one row per participant per level with summary info 
-            - all_final_colors_long: all data rows for all participants and all levels' sublevels.
-            - level_1 to level_8: one sheet per level with all kept attempts for that level
+        - participant_summary: one row per participant with demographics and level summary (highest level overview)
+        - all_levels_short: one row per participant per level with summary info 
+        - all_final_colors_long: all data rows for all participants and all levels' sublevels.
+        - level_1 to level_8: one sheet per level with all kept attempts for that level
 
     2. discarded_results.xlsx
         Sheets:
