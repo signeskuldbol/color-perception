@@ -1,5 +1,6 @@
 # color-perception
 This project consists of 2 files:
+
     create_excel_files_and_sort_data
         - Creates excel files: one containing all data, and another for the discarded attempts with reasoning  
     analyse_and_plot_data
