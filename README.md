@@ -25,6 +25,7 @@ By running the script the following is created:
 Then open "analyse_and_plot_data" and run that. This creates plots for the data and performs analasys of the data. 
 
 Expected project structure:
+
     color-perception/
     └── data_color_crush/
         ├── create_excel_files_and_sort_data
