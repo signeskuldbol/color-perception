@@ -8,18 +8,6 @@ This project consists of 2 files:
 ## Running the Code
 Start by opening "create_excel_files_and_sort_data" search for "TODO" and update the folder name for the raw data folder. 
 
-Expected project structure:
-    color-perception/
-    └── data_color_crush/
-        ├── create_excel_files_and_sort_data
-        ├── "-Folder Name-"/
-        │   ├── participant_file_1.txt
-        │   ├── participant_file_2.txt
-        │   └── ...
-        └── excel_files/
-            ├── combined_final_results.xlsx
-            └── discarded_results.xlsx
-
 By running the script the following is created:
     1. combined_final_results.xlsx
         Sheets:
@@ -34,3 +22,18 @@ By running the script the following is created:
         - discarded_level_attempts: structurally incomplete attempts or attempts removed due to filtering.
 
 Then open "analyse_and_plot_data" and run that. This creates plots for the data and performs analasys of the data. 
+
+Expected project structure:
+    color-perception/
+    └── data_color_crush/
+        ├── create_excel_files_and_sort_data
+        ├── analyse_and_plot_data
+        ├── "-Folder Name-"/
+        │   ├── participant_file_1.txt
+        │   ├── participant_file_2.txt
+        │   └── ...
+        ├── "plots"/
+        │   └── ...
+        └── excel_files/
+            ├── combined_final_results.xlsx
+            └── discarded_results.xlsx
