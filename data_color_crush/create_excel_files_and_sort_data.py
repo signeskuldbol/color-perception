@@ -65,7 +65,7 @@ import pandas as pd
 
 project_folder = Path(__file__).resolve().parent
 
-input_folder = project_folder / "users_23_juli_2026"
+input_folder = project_folder / "users_23_juli_2026" #TODO: change this to the correct folder with participant .txt files
 output_folder = project_folder / "excel_files"
 
 output_file = output_folder / "combined_final_results.xlsx"
