@@ -22,7 +22,7 @@ By running the script the following is created:
         - empty_files: participant files with no log rows found
         - discarded_level_attempts: structurally incomplete attempts or attempts removed due to filtering.
 
-Then open "analyse_and_plot_data" and run that. This creates plots for the data and performs analasys of the data. 
+Then open "analyse_and_plot_data" and run that. This creates plots for the data and performs analasys of the data which can be found in the "statistical_analasys" file. 
 
 Expected project structure:
 
@@ -34,8 +34,9 @@ Expected project structure:
         │   ├── participant_file_1.txt
         │   ├── participant_file_2.txt
         │   └── ...
-        ├── "plots"/
+        ├── plots/
         │   └── ...
         └── excel_files/
             ├── combined_final_results.xlsx
+            ├── statistical_analasys.xlsx
             └── discarded_results.xlsx
