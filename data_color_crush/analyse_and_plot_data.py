@@ -159,7 +159,7 @@ AGE_LABELS = ["<=19", "20-29", "30-39", "40-49", "50+"]
 # plots, compass spiderwebs and six-axis radars. One PNG per participant or per
 # participant/level/attempt, so this is a few hundred files at full sample size.
 # Set to False to skip them all when you only want the group-level results.
-MAKE_PARTICIPANT_DIAGNOSTIC_PLOTS = True
+MAKE_PARTICIPANT_DIAGNOSTIC_PLOTS = True #TODO
 DIAGNOSTIC_PLOT_DPI = 150
 FIGURE_DPI = 300
 
